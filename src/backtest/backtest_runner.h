@@ -49,7 +49,7 @@ namespace bt {
         InstrumentParams inst_;
         MatchingEngine engine_;
         OrderBook book_;
-        std::unique_ptr<MarketMakingStrategy> mm_;
+        std::shared_ptr<MarketMakingStrategy> mm_;
         std::unique_ptr<BacktestExchange> exchange_;
     };
 

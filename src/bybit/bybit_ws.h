@@ -155,7 +155,7 @@ private:
     std::unordered_map<std::string, std::unique_ptr<TimeWindowVWMA>> vwmas_;
     std::unordered_map<std::string, std::unique_ptr<DynamicBBEngine>> bbs_;
     std::unordered_map<std::string, std::unique_ptr<ClusterEngine>> clusters_;
-    std::unordered_map<std::string, std::unique_ptr<MarketMakingStrategy>> mm_strategies_;
+    std::unordered_map<std::string, std::shared_ptr<MarketMakingStrategy>> mm_strategies_;
     OrderExecutor* order_executor_ = nullptr;
 
     std::set<std::string> mm_active_symbols_;

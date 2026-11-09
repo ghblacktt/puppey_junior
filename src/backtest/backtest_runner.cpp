@@ -29,7 +29,7 @@ namespace bt {
         // TODO: передать реальный cluster если нужно для VPIN
         // Пока создаём заглушку
         static ClusterEngine stub_cluster;
-        mm_ = std::make_unique<MarketMakingStrategy>(
+        mm_ = std::make_shared<MarketMakingStrategy>(
                 book_, stub_cluster, *exchange_,
                 cfg_.symbol, cfg_.base_spread_bps / 10000.0,
                 cfg_.qty_usd, cfg_.max_position_usd);

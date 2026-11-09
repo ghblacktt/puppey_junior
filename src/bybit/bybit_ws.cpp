@@ -182,7 +182,7 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
                          : min_hs * 2.0;
 
     // ── Создание MM ──
-    auto mm = std::make_unique<MarketMakingStrategy>(
+    auto mm = std::make_shared<MarketMakingStrategy>(
             it->second->orderbook, it->second->cluster, *exchange_,
             symbol, base_spread, qty_usd, max_position_usd);
     if (signal_engine_) {
@@ -192,6 +192,7 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     if (is_bitunix_symbol(symbol)) {
         mm->set_is_bitunix_symbol(true);
     }
+    mm->set_executor(pos_manage_timer_.get_executor());
     mm->set_maker_fee_bps(g.maker_fee_bps);
     mm->set_use_adaptive(true);
 
@@ -718,23 +719,35 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                 type_str = std::string(type_sv);
             state.orderbook.update(data_field, type_str);
 
+            double _bb = state.orderbook.get_best_bid();
+            double _ba = state.orderbook.get_best_ask();
+            if (_bb <= 0.0 || _ba <= 0.0 || _bb >= _ba) {
+                static std::unordered_map<std::string, uint64_t> _bad_log;
+                static std::unordered_map<std::string, uint64_t> _bad_count;
+                _bad_count[symbol]++;
+                uint64_t _now_dbg = ch::now_ms();
+                if (_now_dbg - _bad_log[symbol] > 30'000) {
+                    std::cerr << "[WS-BAD] " << symbol
+                              << " type=" << type_str
+                              << " bb=" << _bb << " ba=" << _ba
+                              << " bad_total=" << _bad_count[symbol] << "\n";
+                    _bad_log[symbol] = _now_dbg;
+                }
+                return;
+            }
+
             if (signal_engine_) {
                 signal_engine_->on_bybit_book(
-                        symbol,
-                        state.orderbook.get_best_bid(),
-                        state.orderbook.get_best_ask(),
+                        symbol, _bb, _ba,
                         state.orderbook.get_best_bid_size(),
                         state.orderbook.get_best_ask_size());
             }
 
             if (on_book_update_cb_) on_book_update_cb_(symbol);
 
-            // === NEW: paper exchange BBO update ===
             if (paper_exchange_) {
                 paper_exchange_->on_book_update(
-                        symbol,
-                        state.orderbook.get_best_bid(),
-                        state.orderbook.get_best_ask(),
+                        symbol, _bb, _ba,
                         state.orderbook.get_best_bid_size(),
                         state.orderbook.get_best_ask_size());
             }
@@ -742,11 +755,9 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
             if (ch_writer_) {
                 uint64_t ts_event = 0;
                 (void)doc["ts"].get_uint64().get(ts_event);
-                double bid = state.orderbook.get_best_bid();
-                double ask = state.orderbook.get_best_ask();
                 ch_writer_->push_book(ch::VenueBybit, symbol,
                                       ch::now_ms(), ts_event,
-                                      bid, ask,
+                                      _bb, _ba,
                                       state.orderbook.get_best_bid_size(),
                                       state.orderbook.get_best_ask_size());
             }
@@ -1040,6 +1051,8 @@ void BybitWSClient::on_private_execution(
         double price, double qty, double fee,
         const std::string& fee_currency, uint64_t exec_time, bool is_maker) {
 
+// NOTE: paper-fallback вызывает это из WS-треда. Live идёт через on_private_execution
+// на strand'е pos_manage_timer_. Для paper TODO: сериализовать через post(exec_).
     // dedup (WS может переотправить при реконнекте)
     if (processed_execution_ids_.count(exec_id)) return;
     processed_execution_ids_.insert(exec_id);

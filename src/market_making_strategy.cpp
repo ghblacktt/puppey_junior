@@ -271,22 +271,10 @@ void MarketMakingStrategy::tick() {
 
     // ── TOXIC cancel flags ──
     if (pending_cancel_ask_.exchange(false, std::memory_order_relaxed)) {
-        if (!ask_order_id_.empty()) {
-            api_.cancel_order(symbol_, ask_order_id_);
-            log_cancel(ask_order_id_, "TOXIC_THROUGH");
-            ask_order_id_.clear();
-            last_ask_p_ = 0.0;
-            ask_cooldown_until_ = now + 5'000;
-        }
+        cancel_ask_now("TOXIC_THROUGH");
     }
     if (pending_cancel_bid_.exchange(false, std::memory_order_relaxed)) {
-        if (!bid_order_id_.empty()) {
-            api_.cancel_order(symbol_, bid_order_id_);
-            log_cancel(bid_order_id_, "TOXIC_THROUGH");
-            bid_order_id_.clear();
-            last_bid_p_ = 0.0;
-            bid_cooldown_until_ = now + 5'000;
-        }
+        cancel_bid_now("TOXIC_THROUGH");
     }
 
     // ── VPIN/TOXIC pause ──
@@ -595,7 +583,7 @@ void MarketMakingStrategy::tick() {
     // ═══ HMA через spread asymmetry (амплитуда ±30%) ═══
     // HMA +4 bps → bid_half *= 0.7 (агрессивнее), ask_half *= 1.3 (пассивнее)
     if (std::abs(hma_skew_bps) > 0.5) {
-        double hma_factor = std::clamp(hma_skew_bps / 15.0, -0.3, 0.3);
+        double hma_factor = std::clamp(hma_skew_bps / 30.0, -0.05, 0.05);
         bid_half *= (1.0 - hma_factor);
         ask_half *= (1.0 + hma_factor);
     }
@@ -907,6 +895,8 @@ void MarketMakingStrategy::on_order_filled(const std::string& order_id,
                                            double fill_qty,
                                            const std::string& side,
                                            bool is_full_fill) {
+    // NOTE: paper-fallback вызывает это из WS-треда. Live идёт через on_private_execution
+// на strand'е pos_manage_timer_. Для paper TODO: сериализовать через post(exec_).
     double      p = fill_price;
     std::string s = side;
 
@@ -1021,42 +1011,30 @@ void MarketMakingStrategy::on_order_filled(const std::string& order_id,
 // TOXIC DETECTION
 // ============================================================
 void MarketMakingStrategy::on_trade_through_ask(double price, double size) {
-    if (ask_order_id_.empty()) return;
-    if (last_ask_p_ <= 0.0) return;
-    if (price < last_ask_p_ - 1e-9) return;
+    // Cheap pre-filter, race-free (только чтение аргументов)
+    if (price * size < 3000.0) return;
 
-    double notional = price * size;
-    if (notional < 3000.0) return;
-
-    pending_cancel_ask_.store(true, std::memory_order_relaxed);
-
-    static std::unordered_map<std::string, uint64_t> last_log_ts;
-    uint64_t now = this->now();
-    if (now - last_log_ts[symbol_] > 5'000) {
-        last_log_ts[symbol_] = now;
-        std::cout << "[MM] " << symbol_
-                  << " TRADE-THROUGH ask: px=" << price
-                  << " our_ask=" << last_ask_p_
-                  << " sz=" << size
-                  << " notional=$" << notional << "\n";
+    if (has_exec_) {
+        // Публикуем на executor-странд; сами проверки — там.
+        net::post(exec_, [self = weak_from_this(), price]() {
+            if (auto sp = self.lock()) sp->cancel_ask_on_through(price, "TOXIC_THROUGH");
+        });
+        return;
     }
+    // Fallback (бэктест / paper без executor) — старое поведение
+    pending_cancel_ask_.store(true, std::memory_order_relaxed);
 }
 
 void MarketMakingStrategy::on_trade_through_bid(double price, double size) {
-    if (bid_order_id_.empty()) return;
-    if (last_bid_p_ <= 0.0) return;
-    if (price > last_bid_p_ + 1e-9) return;
+    if (price * size < 3000.0) return;
 
-    double notional = price * size;
-    if (notional < 3000.0) return;
-
+    if (has_exec_) {
+        net::post(exec_, [self = weak_from_this(), price]() {
+            if (auto sp = self.lock()) sp->cancel_bid_on_through(price, "TOXIC_THROUGH");
+        });
+        return;
+    }
     pending_cancel_bid_.store(true, std::memory_order_relaxed);
-
-    std::cout << "[MM] " << symbol_
-              << " TRADE-THROUGH bid: px=" << price
-              << " our_bid=" << last_bid_p_
-              << " sz=" << size
-              << " notional=$" << notional << "\n";
 }
 
 // ============================================================
@@ -1299,6 +1277,38 @@ MarketMakingStrategy::drain_finalized_markouts() {
     std::vector<FinalizedMarkout> out;
     out.swap(finalized_markouts_);
     return out;
+}
+
+void MarketMakingStrategy::cancel_ask_on_through(double trade_price, const std::string& reason) {
+    if (ask_order_id_.empty()) return;
+    if (last_ask_p_ <= 0.0) return;
+    if (trade_price < last_ask_p_ - 1e-9) return;
+    cancel_ask_now(reason);
+}
+
+void MarketMakingStrategy::cancel_bid_on_through(double trade_price, const std::string& reason) {
+    if (bid_order_id_.empty()) return;
+    if (last_bid_p_ <= 0.0) return;
+    if (trade_price > last_bid_p_ + 1e-9) return;
+    cancel_bid_now(reason);
+}
+
+void MarketMakingStrategy::cancel_ask_now(const std::string& reason) {
+    if (ask_order_id_.empty()) return;
+    api_.cancel_order(symbol_, ask_order_id_);
+    log_cancel(ask_order_id_, reason);
+    ask_order_id_.clear();
+    last_ask_p_ = 0.0;
+    ask_cooldown_until_ = this->now() + 5'000;
+}
+
+void MarketMakingStrategy::cancel_bid_now(const std::string& reason) {
+    if (bid_order_id_.empty()) return;
+    api_.cancel_order(symbol_, bid_order_id_);
+    log_cancel(bid_order_id_, reason);
+    bid_order_id_.clear();
+    last_bid_p_ = 0.0;
+    bid_cooldown_until_ = this->now() + 5'000;
 }
 
 void MarketMakingStrategy::shutdown_gracefully(const std::string& reason) {
