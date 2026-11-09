@@ -62,7 +62,6 @@ namespace bt {
         double sign = (f.side == "Buy") ? 1.0 : -1.0;
         double realized = apply_position(sign, f.price, f.qty);
         fees_paid_ += f.fee;
-        realized_pnl_ -= f.fee;
         pos_.realized_pnl -= f.fee;
 
         last_fills_[f.order_id] = f;
@@ -105,7 +104,7 @@ namespace bt {
             last_ret_msg_ = "invalid qty";
             return "";
         }
-        if (qty * px > 10000.0) {   // notional > $10k — явно баг
+        if (qty * px > 500.0) {   // notional > $10k — явно баг
             static int big_qty_count = 0;
             if (big_qty_count < 10) {
                 std::cerr << "[BT-SAFETY] reject huge order: qty=" << qty
@@ -120,6 +119,7 @@ namespace bt {
         engine_.submit_limit(o, bb, ba,
                              book_.get_best_bid_size(),
                              book_.get_best_ask_size(),
+                             tick_size_,
                              current_ts_);
 
         last_ret_code_ = 0;

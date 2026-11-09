@@ -392,11 +392,28 @@ void MarketMakingStrategy::tick() {
             }
             uint64_t dynamic_max_hold;
             if (max_hold_override_sec_ > 0) {
-                dynamic_max_hold = base_hold;
+                dynamic_max_hold = static_cast<uint64_t>(max_hold_override_sec_) * 1000ULL;
             } else {
                 dynamic_max_hold = std::min(base_hold, adaptive_params_.max_hold_ms);
             }
+
+// ═══════════════════════════════════════════════════════════
+// КРИТИЧНО: проверка и закрытие (была пропущена!)
+// ═══════════════════════════════════════════════════════════
+            if (age_ms > dynamic_max_hold) {
+                static std::unordered_map<std::string, uint64_t> last_hold_log;
+                if (now - last_hold_log[symbol_] > 10'000) {
+                    std::cerr << "[MM] " << symbol_ << " MAX HOLD age="
+                              << age_ms / 1000 << "s limit="
+                              << dynamic_max_hold / 1000 << "s inv=$"
+                              << inventory_usd_ << "\n";
+                    last_hold_log[symbol_] = now;
+                }
+                close_position_market(best_bid, best_ask, "MAX_HOLD");
+                return;
+            }
         }
+
     }
 
     // ── HARD CAP ──
@@ -622,7 +639,7 @@ void MarketMakingStrategy::tick() {
     ask_price = std::ceil (api_.normalize_price(symbol_, ask_price) / tick_size - 1e-9) * tick_size;
 
     // ── HARD FLOOR (full, без factor) ──
-    constexpr int kMinTicksFromTop = 5;
+    constexpr int kMinTicksFromTop = 1;
     constexpr double kMinBpsFromTop = 0.5;
 
     double min_gap = std::max(tick_size * kMinTicksFromTop, best_bid * 1e-4);
@@ -1173,6 +1190,42 @@ void MarketMakingStrategy::update_pending_markouts(uint64_t now) {
         if (all_done) {
             m.finalized = true;
             persist_markout(m);
+
+            // Для backtest: сохраняем в памяти (live идёт в БД)
+            bool has_db = db_conn_ && db_conn_->is_open();
+            if (!has_db) {
+                FinalizedMarkout fm;
+                fm.order_id           = m.order_id;
+                fm.side               = m.side;
+                fm.qty                = m.qty;
+                fm.fill_price         = m.fill_price;
+                fm.fill_time_ms       = m.fill_time_ms;
+                fm.fair_price_at_fill = m.fair_price_at_fill;
+                fm.mid_100ms          = m.mids[0];
+                fm.mid_500ms          = m.mids[1];
+                fm.mid_1s             = m.mids[2];
+                fm.mid_5s             = m.mids[3];
+                fm.mid_30s            = m.mids[4];
+
+                auto sign = (m.side == "Buy") ? 1.0 : -1.0;
+                auto mk_bps = [&](double mk_mid) -> double {
+                    if (mk_mid <= 0.0 || m.fill_price <= 0.0) return 0.0;
+                    return sign * (mk_mid - m.fill_price) / m.fill_price * 10000.0;
+                };
+                fm.mk_100ms_bps = mk_bps(fm.mid_100ms);
+                fm.mk_500ms_bps = mk_bps(fm.mid_500ms);
+                fm.mk_1s_bps    = mk_bps(fm.mid_1s);
+                fm.mk_5s_bps    = mk_bps(fm.mid_5s);
+                fm.mk_30s_bps   = mk_bps(fm.mid_30s);
+
+                // Cap памяти (защита от unbounded)
+                if (finalized_markouts_.size() >= 100'000) {
+                    finalized_markouts_.erase(finalized_markouts_.begin(),
+                                              finalized_markouts_.begin() + 50'000);
+                }
+                finalized_markouts_.push_back(std::move(fm));
+            }
+
             to_remove.push_back(oid);
         }
     }
@@ -1239,6 +1292,13 @@ double MarketMakingStrategy::compute_hma_skew_bps() const {
 
     // Ограничиваем как signal_engine (max 8 bps)
     return std::clamp(skew_bps, -4.0, 4.0);
+}
+
+std::vector<MarketMakingStrategy::FinalizedMarkout>
+MarketMakingStrategy::drain_finalized_markouts() {
+    std::vector<FinalizedMarkout> out;
+    out.swap(finalized_markouts_);
+    return out;
 }
 
 void MarketMakingStrategy::shutdown_gracefully(const std::string& reason) {

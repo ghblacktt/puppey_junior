@@ -120,6 +120,10 @@ namespace bt {
                 if (mm_) {
                     try {
                         mm_->tick();
+                        auto finalized = mm_->drain_finalized_markouts();
+                        for (auto& m : finalized) {
+                            r.markouts.push_back(m);
+                        }
                     } catch (const std::exception& e) {
                         std::cerr << "[MM-EXC] " << e.what() << "\n";
                     }
@@ -135,6 +139,13 @@ namespace bt {
                 }
             } else {
                 ++r.trade_events;
+                // ═══ MM toxic detection — как в live bybit_ws.cpp ═══
+                if (mm_) {
+                    if (!ev.trade.is_buyer_maker)
+                        mm_->on_trade_through_ask(ev.trade.price, ev.trade.volume);
+                    else
+                        mm_->on_trade_through_bid(ev.trade.price, ev.trade.volume);
+                }
                 exchange_->on_trade(ev.trade);
             }
 

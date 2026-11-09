@@ -25,6 +25,27 @@ using arb::IExchange;
 class CrossVenueSignalEngine;
 class MarketMakingStrategy {
 public:
+
+
+    struct FinalizedMarkout {
+        std::string order_id;
+        std::string side;
+        double   qty             = 0.0;
+        double   fill_price      = 0.0;
+        uint64_t fill_time_ms    = 0;
+        double   fair_price_at_fill = 0.0;
+        double   mid_100ms       = 0.0;
+        double   mid_500ms       = 0.0;
+        double   mid_1s          = 0.0;
+        double   mid_5s          = 0.0;
+        double   mid_30s         = 0.0;
+        double   mk_100ms_bps    = 0.0;
+        double   mk_500ms_bps    = 0.0;
+        double   mk_1s_bps       = 0.0;
+        double   mk_5s_bps       = 0.0;
+        double   mk_30s_bps      = 0.0;
+        bool     finalized       = true;   // для совместимости с backtest main
+    };
     // ============================================================
     // Rolling σ estimator
     // ============================================================
@@ -178,12 +199,13 @@ public:
     // Публичный доступ к inventory для disable-логики
     double inventory_usd() const { return inventory_usd_; }
     void set_max_hold_sec(int sec) { max_hold_override_sec_ = std::max(0, sec); }
+
+    std::vector<FinalizedMarkout> drain_finalized_markouts();
+
 private:
     HmaFilter    hma_fast_{8,  1000};   // 8 секунд, быстрый тренд
     HmaFilter    hma_slow_{32, 1000};   // 32 секунды, медленный тренд
     KernelFilter kernel_{120'000, 30'000};   // 2 мин окно, 30s bandwidth
-
-// Метод
     double compute_hma_skew_bps() const;
     double hma_skew_bps_ = 0.0;
     uint64_t pending_close_first_attempt_ms_ = 0;
@@ -304,7 +326,7 @@ private:
         bool finalized = false;
     };
     std::unordered_map<std::string, PendingMarkout> pending_markouts_;
-
+    std::vector<FinalizedMarkout> finalized_markouts_;
 // ── P&L attribution (per-symbol accumulators) ──
     double spread_income_total_ = 0.0;
     double fees_total_          = 0.0;

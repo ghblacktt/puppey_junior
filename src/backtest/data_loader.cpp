@@ -28,73 +28,54 @@ bool DataLoader::is_connected() const {
     return impl_ && impl_->client != nullptr;
 }
 
-std::vector<BookSnapshot> DataLoader::load_book_updates(
-        const std::string& symbol,
-        uint64_t from_ts_ms, uint64_t to_ts_ms) {
-    std::vector<BookSnapshot> out;
-    if (!impl_->client) return out;
+    std::vector<BookSnapshot> DataLoader::load_book_updates(
+            const std::string& symbol,
+            uint64_t from_ts, uint64_t to_ts) {
+        std::vector<BookSnapshot> out;
+        out.reserve(100000);
 
-    // toString(update_type) - конвертирует LowCardinality(String) в обычный String
-    std::string query =
-        "SELECT timestamp, update_id, toString(update_type) AS update_type, "
-        "       arrayMap(x -> toFloat64(x), bid_prices) AS bp, "
-        "       arrayMap(x -> toFloat64(x), bid_sizes)  AS bs, "
-        "       arrayMap(x -> toFloat64(x), ask_prices) AS ap, "
-        "       arrayMap(x -> toFloat64(x), ask_sizes)  AS as "
-        "FROM orderbook_updates "
-        "WHERE symbol = '" + symbol + "' "
-        "  AND timestamp >= " + std::to_string(from_ts_ms) + " "
-        "  AND timestamp <= " + std::to_string(to_ts_ms) + " "
-        "ORDER BY timestamp, update_id";
+        try {
+            impl_->client->Select(
+                    "SELECT ts_local, ts_event, bid, ask, bid_sz, ask_sz "
+                    "FROM market_data.raw_books "
+                    "WHERE venue = 'bybit' AND symbol = '" + symbol + "' "
+                                                                      "  AND ts_local >= " + std::to_string(from_ts) +
+                    "  AND ts_local <= " + std::to_string(to_ts) +
+                    "  AND bid > 0 AND ask > 0 AND bid < ask "
+                    "ORDER BY ts_local",
+                    [&out](const clickhouse::Block& block) {
+                        auto col_ts_local = block[0]->As<clickhouse::ColumnUInt64>();
+                        auto col_ts_event = block[1]->As<clickhouse::ColumnUInt64>();
+                        auto col_bid      = block[2]->As<clickhouse::ColumnFloat64>();
+                        auto col_ask      = block[3]->As<clickhouse::ColumnFloat64>();
+                        auto col_bid_sz   = block[4]->As<clickhouse::ColumnFloat64>();
+                        auto col_ask_sz   = block[5]->As<clickhouse::ColumnFloat64>();
 
-    impl_->client->Select(query, [&out, &symbol](const clickhouse::Block& block) {
-        for (size_t row = 0; row < block.GetRowCount(); ++row) {
-            BookSnapshot snap;
-            snap.symbol       = symbol;
-            snap.timestamp_ms = block[0]->As<clickhouse::ColumnUInt64>()->At(row);
-            snap.update_id    = block[1]->As<clickhouse::ColumnUInt64>()->At(row);
+                        size_t n = block.GetRowCount();
+                        out.reserve(out.size() + n);
+                        for (size_t i = 0; i < n; ++i) {
+                            BookSnapshot snap;
+                            snap.timestamp_ms = col_ts_local->At(i);
+                            snap.update_id    = col_ts_event->At(i);  // не идеально, но unused
+                            snap.update_type  = "snapshot";
 
-            auto type_col = block[2]->As<clickhouse::ColumnString>();
-            if (type_col) {
-                snap.update_type = type_col->At(row);
-            } else {
-                snap.update_type = "delta";
-            }
+                            BookLevel bid;
+                            bid.price = col_bid->At(i);
+                            bid.size  = col_bid_sz->At(i);
+                            BookLevel ask;
+                            ask.price = col_ask->At(i);
+                            ask.size  = col_ask_sz->At(i);
 
-            auto read_doubles = [&](size_t idx) -> std::vector<double> {
-                std::vector<double> res;
-                auto arr = block[idx]->As<clickhouse::ColumnArray>();
-                if (!arr) return res;
-                auto inner = arr->GetAsColumn(row);
-                if (!inner) return res;
-                auto f64 = std::dynamic_pointer_cast<clickhouse::ColumnFloat64>(inner);
-                if (!f64) return res;
-                size_t n = f64->Size();
-                res.reserve(n);
-                for (size_t i = 0; i < n; ++i) res.push_back(f64->At(i));
-                return res;
-            };
-
-            auto bp = read_doubles(3);
-            auto bs = read_doubles(4);
-            auto ap = read_doubles(5);
-            auto as = read_doubles(6);
-
-            size_t n_bids = std::min(bp.size(), bs.size());
-            for (size_t i = 0; i < n_bids; ++i)
-                snap.bids.push_back({bp[i], bs[i]});
-
-            size_t n_asks = std::min(ap.size(), as.size());
-            for (size_t i = 0; i < n_asks; ++i)
-                snap.asks.push_back({ap[i], as[i]});
-
-            out.push_back(std::move(snap));
+                            snap.bids.push_back(bid);
+                            snap.asks.push_back(ask);
+                            out.push_back(std::move(snap));
+                        }
+                    });
+        } catch (const std::exception& e) {
+            std::cerr << "[DL] load_book_updates error: " << e.what() << "\n";
         }
-    });
-
-    return out;
-}
-
+        return out;
+    }
 std::vector<TradeEvent> DataLoader::load_trades(
         const std::string& symbol,
         uint64_t from_ts_ms, uint64_t to_ts_ms) {

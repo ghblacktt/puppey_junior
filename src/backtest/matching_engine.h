@@ -58,6 +58,7 @@ namespace bt {
         void submit_limit(const BtOrder& o,
                           double best_bid, double best_ask,
                           double bid_size, double ask_size,
+                          double tick_size_real,
                           uint64_t now_ts);
 
         // Market order — fills сразу по BBO (с проскальзыванием)

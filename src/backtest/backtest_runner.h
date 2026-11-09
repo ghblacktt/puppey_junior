@@ -35,7 +35,7 @@ namespace bt {
         double final_position_avg = 0.0;
         uint64_t first_ts = 0;
         uint64_t last_ts = 0;
-        std::vector<BtMarkout> markouts;
+        std::vector<MarketMakingStrategy::FinalizedMarkout> markouts;
     };
 
     class BacktestRunner {

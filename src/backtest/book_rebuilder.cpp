@@ -7,51 +7,36 @@ namespace bt {
     bool BookRebuilder::apply(OrderBook& book,
                               const BookSnapshot& update,
                               std::string* out_err) {
-        if (update.bids.empty() && update.asks.empty()) {
-            if (out_err) *out_err = "empty update";
+        if (update.bids.empty() || update.asks.empty()) {
+            if (out_err) *out_err = "empty sides";
             return false;
         }
 
-        // Формируем JSON для OrderBook::update
-        // (переиспользуем существующую логику, чтобы не дублировать apply)
+        // Строим snapshot JSON с BBO
         std::stringstream ss;
-        ss << "{";
-        ss << "\"u\":" << update.update_id << ",";
-        if (!update.bids.empty()) {
-            ss << "\"b\":[";
-            for (size_t i = 0; i < update.bids.size(); ++i) {
-                if (i > 0) ss << ",";
-                ss << "[\"" << std::fixed << std::setprecision(8)
-                   << update.bids[i].price << "\",\""
-                   << update.bids[i].size << "\"]";
-            }
-            ss << "],";
-        }
-        if (!update.asks.empty()) {
-            ss << "\"a\":[";
-            for (size_t i = 0; i < update.asks.size(); ++i) {
-                if (i > 0) ss << ",";
-                ss << "[\"" << std::fixed << std::setprecision(8)
-                   << update.asks[i].price << "\",\""
-                   << update.asks[i].size << "\"]";
-            }
-            ss << "],";
-        }
-        // Убираем trailing comma
-        std::string json = ss.str();
-        if (json.back() == ',') json.pop_back();
-        json += "}";
+        ss << "{\"u\":" << update.update_id << ",\"b\":[[\""
+           << std::fixed << std::setprecision(8) << update.bids[0].price
+           << "\",\"" << update.bids[0].size << "\"]],\"a\":[[\""
+           << update.asks[0].price << "\",\"" << update.asks[0].size << "\"]]}";
 
-        // Парсим через simdjson
         simdjson::dom::parser parser;
         simdjson::dom::element doc;
-        if (parser.parse(json).get(doc) != simdjson::SUCCESS) {
+        if (parser.parse(ss.str()).get(doc) != simdjson::SUCCESS) {
             if (out_err) *out_err = "parse failed";
             return false;
         }
 
-        book.update(doc, update.update_type);
-        book.set_last_update_ms(update.timestamp_ms);   // ← переопределяем real → backtest
+        // Всегда snapshot → book пересобирается заново
+        book.update(doc, "snapshot");
+        book.set_last_update_ms(update.timestamp_ms);
+
+        // Валидация
+        double bb = book.get_best_bid();
+        double ba = book.get_best_ask();
+        if (bb <= 0.0 || ba <= 0.0 || bb >= ba) {
+            if (out_err) *out_err = "invalid book";
+            return false;
+        }
         return true;
     }
 

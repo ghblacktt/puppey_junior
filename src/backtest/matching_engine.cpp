@@ -22,6 +22,7 @@ namespace bt {
     void MatchingEngine::submit_limit(const BtOrder& o,
                                       double best_bid, double best_ask,
                                       double bid_size, double ask_size,
+                                      double tick_size_real,
                                       uint64_t now_ts) {
         BtOrder ord = o;
         ord.submit_ts = now_ts;
@@ -39,18 +40,21 @@ namespace bt {
 // - 2 tick: 50%
 // - 3+ tick: 20%
 // Queue model: чем глубже уровень, тем больше конкурентов
-        double tick_est = is_buy ? best_bid * 1e-5 : best_ask * 1e-5;
+        double tick_est = tick_size_real;
+        if (tick_est <= 0) tick_est = is_buy ? best_bid * 1e-5 : best_ask * 1e-5;
         if (tick_est <= 0) tick_est = 1e-6;
 
         double price_gap = is_buy ? (best_bid - ord.price) : (ord.price - best_ask);
         double best_size = is_buy ? bid_size : ask_size;
 
         if (price_gap < 0.0) {
-            ord.queue_ahead = 0.0;
+            ord.queue_ahead = 0.0;   // cross — taker
         } else {
             double gap_ticks = price_gap / tick_est;
-            // Чем глубже, тем больше впереди. Минимум best_size.
-            ord.queue_ahead = best_size * std::max(1.0, gap_ticks);
+            if (gap_ticks < 0.5)       ord.queue_ahead = best_size * 1.0;    // на best_bid
+            else if (gap_ticks < 1.5)  ord.queue_ahead = best_size * 0.5;    // 1 tick
+            else if (gap_ticks < 3.5)  ord.queue_ahead = best_size * 0.15;   // 2-3 tick
+            else                       ord.queue_ahead = best_size * 0.03;   // 4+ tick — почти пусто
         }
 
         ord.placed_ts = now_ts + random_latency();
@@ -158,14 +162,11 @@ namespace bt {
 // Trade должен ТОЧНО пробить нашу цену, не просто коснуться
             bool hit = false;
             if (is_buy) {
-                hit = (trade.price < o.price);   // строго ниже
+                hit = (trade.price <= o.price);  // touch или ниже
             } else {
-                hit = (trade.price > o.price);   // строго выше
+                hit = (trade.price >= o.price);  // touch или выше
             }
             if (!hit) continue;
-
-            // Сколько trade может съесть на нашем уровне
-            double trade_remaining = trade.volume;
 
             // 1) Сначала съедаем queue_ahead
             if (o.queue_ahead > 0.0) {
