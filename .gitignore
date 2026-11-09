@@ -1,0 +1,80 @@
+# build
+build/
+build-*/
+cmake-build-*/
+cmake-build-*/.cmake/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# compile db
+compile_commands.json
+.cache/
+
+# binaries / libs
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+bt_backtest
+bt_test_load
+bybit_client
+test_ch
+
+# logs / runtime data
+logs/
+*.log
+build/data/
+data/
+
+# deps (CMake FetchContent сам скачает)
+_deps/
+
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials*
+
+# build
+build/
+build-*/
+cmake-build-*/
+cmake-build-*/.cmake/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# deps
+_deps/
+
+# secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# binaries
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+bt_backtest
+bt_test_load
+bybit_client
+test_ch
+
+# logs / runtime
+logs/
+*.log
+data/
