@@ -39,7 +39,8 @@ BybitWSClient::BybitWSClient(net::io_context& ioc, ssl::context& ctx,
           inv_refresh_timer_(net::make_strand(ioc)),
           pos_manage_timer_(net::make_strand(ioc)),
           reconnect_timer_(net::make_strand(ioc)),
-          subscribe_delay_timer_(net::make_strand(ioc))
+          subscribe_delay_timer_(net::make_strand(ioc)),
+          regime_update_timer_(net::make_strand(ioc))
 {
     for (const auto& symbol : symbols) {
         tickers_[symbol] = std::make_unique<TickerState>(symbol, api_, 1);
@@ -88,6 +89,7 @@ void BybitWSClient::start_mm_tick() {
               << clr::reset << "\n";
     std::cout << clr::gray << std::string(95, '-') << clr::reset << "\n";
     start_pos_manage();
+    start_regime_update();
 }
 
 // ============================================================
@@ -576,6 +578,7 @@ BybitWSClient::~BybitWSClient() {
     if (trade_tracker_) trade_tracker_->stop();
     if (trade_ws_) trade_ws_->stop();
     if (private_ws_) private_ws_->stop();
+    regime_update_timer_.cancel();
 }
 
 void BybitWSClient::create_websocket() {
@@ -1234,6 +1237,139 @@ std::vector<std::string> BybitWSClient::currently_trading_symbols() const {
         out.push_back(sym);
     }
     return out;
+}
+
+void BybitWSClient::start_regime_update() {
+    regime_update_timer_.expires_after(std::chrono::seconds(30));   // первый раз через 30с
+    regime_update_timer_.async_wait([this](beast::error_code ec) {
+        if (ec) return;
+        do_regime_update();
+        regime_update_timer_.expires_after(std::chrono::minutes(5));
+        regime_update_timer_.async_wait([this](beast::error_code ec2) {
+            if (ec2) return;
+            do_regime_update();
+            start_regime_update();   // рекурсия для следующего цикла
+        });
+    });
+}
+
+void BybitWSClient::do_regime_update() {
+    if (!mm_db_conn_ || !mm_db_conn_->is_open()) return;
+
+    struct SideStats {
+        double med_mk_30s   = 0.0;
+        double med_mk_1s    = 0.0;
+        double hit_pct_1s   = 0.0;
+        int    n            = 0;
+    };
+    // key: symbol → [Buy, Sell]
+    std::unordered_map<std::string, std::array<SideStats, 2>> db;
+
+    // ─── один запрос на всё ───
+    try {
+        pqxx::work txn(*mm_db_conn_);
+        auto r = txn.exec(
+                "SELECT symbol, side,"
+                "  COALESCE(AVG(mk_30s_bps), 0) AS med_mk_30s,"
+                "  COALESCE(AVG(mk_1s_bps),  0) AS med_mk_1s,"
+                "  COALESCE(100.0 * COUNT(*) FILTER (WHERE mk_1s_bps > 0)"
+                "           / NULLIF(COUNT(*), 0), 0) AS hit_pct,"
+                "  COUNT(*) AS n"
+                " FROM mm_markouts"
+                " WHERE finalized = TRUE"
+                "   AND created_at > NOW() - INTERVAL '4 hours'"
+                " GROUP BY symbol, side");
+
+        for (const auto& row : r) {
+            std::string sym  = row["symbol"].as<std::string>();
+            std::string side = row["side"].as<std::string>();
+            int idx = (side == "Buy") ? 0 : 1;
+            auto& x = db[sym][idx];
+            x.med_mk_30s = row["med_mk_30s"].as<double>();
+            x.med_mk_1s  = row["med_mk_1s"].as<double>();
+            x.hit_pct_1s = row["hit_pct"].as<double>();
+            x.n          = row["n"].as<int>();
+        }
+        txn.commit();
+    } catch (const std::exception& e) {
+        std::cerr << "[REGIME] DB query error: " << e.what() << "\n";
+        return;
+    }
+
+    // ─── обновить каждый MM ───
+    uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    int bid_modes[4] = {0, 0, 0, 0};
+    int ask_modes[4] = {0, 0, 0, 0};
+
+    for (auto& [sym, mm_ptr] : mm_strategies_) {
+        if (!mm_ptr) continue;
+
+        // Market-derived данные
+        double depth_usdt = 0.0, spread_frac = 0.0, vpin = 0.0;
+        auto tit = tickers_.find(sym);
+        if (tit != tickers_.end()) {
+            vpin = tit->second->cluster.get_vpin(20);
+            auto liq = get_symbol_liquidity(sym);
+            if (liq.is_valid) {
+                depth_usdt  = liq.depth_usdt;
+                spread_frac = liq.spread_pct / 100.0;
+            }
+        }
+
+        // Собрать кандидатов per side
+        mm::SymModeSide cand_bid, cand_ask;
+        auto it = db.find(sym);
+        if (it != db.end()) {
+            const auto& buy_s  = it->second[0];
+            const auto& sell_s = it->second[1];
+
+            cand_bid.med_mk_30s    = buy_s.med_mk_30s;
+            cand_bid.med_mk_1s     = buy_s.med_mk_1s;
+            cand_bid.hit_pct_1s    = buy_s.hit_pct_1s;
+            cand_bid.n_markouts_4h = buy_s.n;
+
+            cand_ask.med_mk_30s    = sell_s.med_mk_30s;
+            cand_ask.med_mk_1s     = sell_s.med_mk_1s;
+            cand_ask.hit_pct_1s    = sell_s.hit_pct_1s;
+            cand_ask.n_markouts_4h = sell_s.n;
+        }
+        cand_bid.mode = mm::classify_side(cand_bid, depth_usdt, spread_frac, vpin);
+        cand_ask.mode = mm::classify_side(cand_ask, depth_usdt, spread_frac, vpin);
+
+        // Гистерезис
+        const auto& prev = mm_ptr->regime();
+        cand_bid = mm::apply_hysteresis(prev.bid, cand_bid, now_ms);
+        cand_ask = mm::apply_hysteresis(prev.ask, cand_ask, now_ms);
+
+        mm::SymModeSnapshot snap;
+        snap.bid          = cand_bid;
+        snap.ask          = cand_ask;
+        snap.depth_usdt   = depth_usdt;
+        snap.spread_frac  = spread_frac;
+        snap.vpin_now     = vpin;
+        snap.updated_ms   = now_ms;
+        snap.has_data     = (cand_bid.n_markouts_4h >= 20) || (cand_ask.n_markouts_4h >= 20);
+        // fill_rate_1h — опционально, не влияет на classify_side
+
+        mm_ptr->set_regime_snapshot(snap);
+
+        bid_modes[static_cast<int>(snap.bid.mode)]++;
+        ask_modes[static_cast<int>(snap.ask.mode)]++;
+    }
+
+    std::cout << "[REGIME] BID:"
+              << " Normal="   << bid_modes[0]
+              << " Tier1="    << bid_modes[1]
+              << " Toxic="    << bid_modes[2]
+              << " Illiquid=" << bid_modes[3]
+              << " | ASK:"
+              << " Normal="   << ask_modes[0]
+              << " Tier1="    << ask_modes[1]
+              << " Toxic="    << ask_modes[2]
+              << " Illiquid=" << ask_modes[3]
+              << "\n";
 }
 
 bool BybitWSClient::has_mm(const std::string& symbol) const {

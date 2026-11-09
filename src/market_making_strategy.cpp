@@ -206,7 +206,10 @@ void MarketMakingStrategy::close_position_market(double best_bid, double best_as
     // Cost: 2 bps maker, не 8.5 bps taker.
     // В paper: fills когда natural flow crosses (30-50% времени).
     // Timeout: 3s → retry (same price). 30s → force aggressive.
-    bool force_aggressive = (now - pending_close_first_attempt_ms_ > 180'000);
+    bool is_toxic = (regime_.bid.mode  == mm::SymMode::Toxic
+                     || regime_.ask.mode  == mm::SymMode::Toxic);
+    uint64_t aggressive_after_ms = is_toxic ? 15'000ULL : 180'000ULL;
+    bool force_aggressive = (now - pending_close_first_attempt_ms_ > aggressive_after_ms);
 
     double close_px;
     if (force_aggressive) {
@@ -385,6 +388,11 @@ void MarketMakingStrategy::tick() {
                 dynamic_max_hold = std::min(base_hold, adaptive_params_.max_hold_ms);
             }
 
+            if (regime_.bid.mode == mm::SymMode::Toxic
+                || regime_.ask.mode == mm::SymMode::Toxic) {
+                dynamic_max_hold = std::min<uint64_t>(dynamic_max_hold, 5'000ULL);
+            }
+
 // ═══════════════════════════════════════════════════════════
 // КРИТИЧНО: проверка и закрытие (была пропущена!)
 // ═══════════════════════════════════════════════════════════
@@ -394,8 +402,10 @@ void MarketMakingStrategy::tick() {
                     std::cerr << "[MM] " << symbol_ << " MAX HOLD age="
                               << age_ms / 1000 << "s limit="
                               << dynamic_max_hold / 1000 << "s inv=$"
-                              << inventory_usd_ << "\n";
-                    last_hold_log[symbol_] = now;
+                              << inventory_usd_
+                              << " b:" << mm::to_str(regime_.bid.mode)
+                              << "/a:" << mm::to_str(regime_.ask.mode) << "\n";
+                    last_hold_log[symbol_] = now;   // ← ДОБАВИТЬ
                 }
                 close_position_market(best_bid, best_ask, "MAX_HOLD");
                 return;
@@ -570,18 +580,22 @@ void MarketMakingStrategy::tick() {
     // ═══════════════════════════════════════════════════════════════
     // bid_half / ask_half — позиционная + HMA асимметрия
     // ═══════════════════════════════════════════════════════════════
-    double bid_half = half_spread;
-    double ask_half = half_spread;
+    // per-side режимный множитель спреда
+    double bid_regime_mult = 1.0, ask_regime_mult = 1.0;
+    if (regime_.bid.mode == mm::SymMode::Toxic)    bid_regime_mult = 1.5;
+    if (regime_.ask.mode == mm::SymMode::Toxic)    ask_regime_mult = 1.5;
+    if (regime_.bid.mode == mm::SymMode::Illiquid) bid_regime_mult = 2.0;
+    if (regime_.ask.mode == mm::SymMode::Illiquid) ask_regime_mult = 2.0;
 
-    // Позиционная
+    double bid_half = half_spread * bid_regime_mult;
+    double ask_half = half_spread * ask_regime_mult;
+
     if (q_ratio > 0.05) {
-        ask_half = half_spread * (1.0 + q_ratio * 0.5);
+        ask_half = half_spread * ask_regime_mult * (1.0 + q_ratio * 0.5);
     } else if (q_ratio < -0.05) {
-        bid_half = half_spread * (1.0 + (-q_ratio) * 0.5);
+        bid_half = half_spread * bid_regime_mult * (1.0 + (-q_ratio) * 0.5);
     }
 
-    // ═══ HMA через spread asymmetry (амплитуда ±30%) ═══
-    // HMA +4 bps → bid_half *= 0.7 (агрессивнее), ask_half *= 1.3 (пассивнее)
     if (std::abs(hma_skew_bps) > 0.5) {
         double hma_factor = std::clamp(hma_skew_bps / 30.0, -0.05, 0.05);
         bid_half *= (1.0 - hma_factor);
@@ -655,16 +669,30 @@ void MarketMakingStrategy::tick() {
 
     if (bid_price >= ask_price) return;
 
-    // ── BLOCK ──
-    bool allow_bid = (bid_price < best_ask) && (q_ratio <  block_ratio_);
-    bool allow_ask = (ask_price > best_bid) && (q_ratio > -block_ratio_);
+    double bid_block_ratio = block_ratio_;
+    double ask_block_ratio = block_ratio_;
+    if (regime_.bid.mode == mm::SymMode::Toxic) bid_block_ratio = 0.30;
+    if (regime_.ask.mode == mm::SymMode::Toxic) ask_block_ratio = 0.30;
+
+    bool allow_bid = (bid_price < best_ask)  && (q_ratio <  bid_block_ratio);
+    bool allow_ask = (ask_price > best_bid)  && (q_ratio > -ask_block_ratio);
+
+    if (regime_.bid.mode == mm::SymMode::Toxic
+        && regime_.bid.n_markouts_4h >= 20
+        && regime_.bid.hit_pct_1s < 20.0) {
+        allow_bid = false;
+    }
+    if (regime_.ask.mode == mm::SymMode::Toxic
+        && regime_.ask.n_markouts_4h >= 20
+        && regime_.ask.hit_pct_1s < 20.0) {
+        allow_ask = false;
+    }
 
     constexpr double kPositionRiskBlock = 0.5;
     if (q_ratio > kPositionRiskBlock) allow_bid = false;
     if (q_ratio < -kPositionRiskBlock) allow_ask = false;
     if (now < ask_cooldown_until_) allow_ask = false;
     if (now < bid_cooldown_until_) allow_bid = false;
-
     if (!allow_bid && !bid_order_id_.empty()) {
         api_.cancel_order(symbol_, bid_order_id_);
         log_cancel(bid_order_id_, "BLOCKED");
@@ -678,39 +706,59 @@ void MarketMakingStrategy::tick() {
         last_ask_p_ = 0.0;
     }
 
-// Base — существующий инвентарь-based
     double qty_factor = 1.0 - std::abs(q_ratio) * 0.7;
+    double adaptive_qty_usd = eff_qty_usd * qty_factor;
 
-// NEW: flow-aware sizing
-// neutral flow (|flow_b| < 0.1) = токсик → qty × 0.4
-// strong flow (|flow_b| > 0.3) = positive edge → qty × 1.3
-    if (signal_engine_) {
-        auto sig = signal_engine_->get_signal(symbol_);
-        double fl = std::abs(sig.bybit_flow_imbalance);
-        if (fl < 0.10) {
-            qty_factor *= 0.4;        // neutral = токсик → маленький
-        } else if (fl > 0.30) {
-            qty_factor *= 1.3;        // strong flow = edge → большой
+    // per-side qty multiplier
+    double bid_qty_mult = 1.0, ask_qty_mult = 1.0;
+    if (regime_.bid.mode == mm::SymMode::Toxic)    bid_qty_mult = 0.3;
+    if (regime_.ask.mode == mm::SymMode::Toxic)    ask_qty_mult = 0.3;
+    if (regime_.bid.mode == mm::SymMode::Illiquid) bid_qty_mult = 0.5;
+    if (regime_.ask.mode == mm::SymMode::Illiquid) ask_qty_mult = 0.5;
+
+    double qty_bid = api_.normalize_qty(symbol_, adaptive_qty_usd * bid_qty_mult / mid);
+    double qty_ask = api_.normalize_qty(symbol_, adaptive_qty_usd * ask_qty_mult / mid);
+
+    if (qty_bid <= 0) {
+        allow_bid = false;
+        if (!bid_order_id_.empty()) {
+            api_.cancel_order(symbol_, bid_order_id_);
+            log_cancel(bid_order_id_, "ZERO_QTY");
+            bid_order_id_.clear();
+            last_bid_p_ = 0.0;
+        }
+    }
+    if (qty_ask <= 0) {
+        allow_ask = false;
+        if (!ask_order_id_.empty()) {
+            api_.cancel_order(symbol_, ask_order_id_);
+            log_cancel(ask_order_id_, "ZERO_QTY");
+            ask_order_id_.clear();
+            last_ask_p_ = 0.0;
         }
     }
 
-    double adaptive_qty_usd = eff_qty_usd * qty_factor;
+    auto min_notional_fix = [&](double q, mm::SymMode mode) -> double {
+        if (q <= 0.0) return 0.0;
+        if (q * mid >= 5.5) return q;
+        if (mode == mm::SymMode::Toxic) return 0.0;   // ← уважаем маленький сайз
+        return api_.normalize_qty(symbol_, 5.5 / mid);
+    };
+    qty_bid = min_notional_fix(qty_bid, regime_.bid.mode);
+    qty_ask = min_notional_fix(qty_ask, regime_.ask.mode);
 
-    double qty = api_.normalize_qty(symbol_, adaptive_qty_usd / mid);
-    if (qty > 0 && qty * mid < 5.0) {
-        double needed_qty = (5.0 * 1.10) / mid;
-        qty = api_.normalize_qty(symbol_, needed_qty);
-    }
-    if (qty <= 0) return;
+    if (qty_bid <= 0) allow_bid = false;
+    if (qty_ask <= 0) allow_ask = false;
 
-    // ── queue preservation ──
-    const double move_threshold = 0.5;
+    const double bid_move_thr = (regime_.bid.mode == mm::SymMode::Tier1) ? 2.0 : 0.5;
+    const double ask_move_thr = (regime_.ask.mode == mm::SymMode::Tier1) ? 2.0 : 0.5;
+
     bool bid_needs_replace = (last_bid_p_ == 0.0)
-                             || (std::abs(last_bid_p_ - bid_price) / half_spread > move_threshold);
+                             || (std::abs(last_bid_p_ - bid_price) / bid_half > bid_move_thr);
     if (now - last_bid_place_ms_ < 3'000 && !bid_order_id_.empty()) bid_needs_replace = false;
 
     bool ask_needs_replace = (last_ask_p_ == 0.0)
-                             || (std::abs(last_ask_p_ - ask_price) / half_spread > move_threshold);
+                             || (std::abs(last_ask_p_ - ask_price) / ask_half > ask_move_thr);
     if (now - last_ask_place_ms_ < 3'000 && !ask_order_id_.empty()) ask_needs_replace = false;
 
     if (!bid_needs_replace && !bid_order_id_.empty()) {
@@ -746,9 +794,9 @@ void MarketMakingStrategy::tick() {
             bid_order_id_.clear();
             last_bid_p_ = 0.0;
         }
-        bid_order_id_ = api_.place_limit_order(symbol_, "Buy", bid_price, qty, 0, 0, 0);
+        bid_order_id_ = api_.place_limit_order(symbol_, "Buy", bid_price, qty_bid, 0, 0, 0);
         if (!bid_order_id_.empty()) {
-            log_order(bid_order_id_, "Buy", bid_price, qty, ctx);
+            log_order(bid_order_id_, "Buy", bid_price, qty_bid, ctx);
             last_bid_p_ = bid_price;
             last_bid_p_time_ms_ = now;
             last_bid_place_ms_ = now;
@@ -757,7 +805,7 @@ void MarketMakingStrategy::tick() {
             int rc = api_.last_ret_code();
             if (rc == 110126) { adaptive_params_.enabled = false; return; }
             if (rc == -1) return;
-            log_reject("Buy", bid_price, qty, ctx, rc, api_.last_ret_msg());
+            log_reject("Buy", bid_price, qty_bid, ctx, rc, api_.last_ret_msg());
         }
     }
 
@@ -769,9 +817,9 @@ void MarketMakingStrategy::tick() {
             ask_order_id_.clear();
             last_ask_p_ = 0.0;
         }
-        ask_order_id_ = api_.place_limit_order(symbol_, "Sell", ask_price, qty, 0, 0, 0);
+        ask_order_id_ = api_.place_limit_order(symbol_, "Sell", ask_price, qty_ask, 0, 0, 0);
         if (!ask_order_id_.empty()) {
-            log_order(ask_order_id_, "Sell", ask_price, qty, ctx);
+            log_order(ask_order_id_, "Sell", ask_price, qty_ask, ctx);
             last_ask_p_ = ask_price;
             last_ask_p_time_ms_ = now;
             last_ask_place_ms_ = now;
@@ -780,7 +828,7 @@ void MarketMakingStrategy::tick() {
             int rc = api_.last_ret_code();
             if (rc == 110126) { adaptive_params_.enabled = false; return; }
             if (rc == -1) return;
-            log_reject("Sell", ask_price, qty, ctx, rc, api_.last_ret_msg());
+            log_reject("Sell", ask_price, qty_ask, ctx, rc, api_.last_ret_msg());
         }
     }
 
@@ -812,7 +860,10 @@ void MarketMakingStrategy::tick() {
                 << pnl_color << pad_l(num(pnl_pct, 2), 7) << "%" << clr::reset
                 << "  " << (adaptive_params_.enabled ? clr::green : clr::red)
                 << (adaptive_params_.enabled ? "ok" : "off") << clr::reset
-                << "\n";
+                << "  " << clr::cyan
+                << "b:" << mm::to_str(regime_.bid.mode)
+                << "/a:" << mm::to_str(regime_.ask.mode)
+                << clr::reset << "\n";
     }
 }
 

@@ -110,6 +110,9 @@ public:
     }
     void start_mm_tick();
 private:
+    void start_regime_update();
+    void do_regime_update();
+    net::steady_timer regime_update_timer_;
     std::string pg_conn_str_;
     std::shared_ptr<ch::Writer> ch_writer_;
     std::set<std::string> bitunix_symbols_;   // пересечение Bybit × Bitunix

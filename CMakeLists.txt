@@ -81,6 +81,8 @@ add_executable(bybit_client
         src/ch/ch_writer.cpp
 
         src/binance/binance_public_ws.cpp
+
+        src/symbol_regime.cpp
 )
 
 target_include_directories(bybit_client PRIVATE
@@ -126,6 +128,7 @@ add_library(bt_core
         src/time_window_vwma.cpp
         src/dynamic_bb_engine.cpp
         src/cross_venue_signal.cpp
+        src/symbol_regime.cpp
 )
 
 target_include_directories(bt_core PUBLIC
