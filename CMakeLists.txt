@@ -81,7 +81,7 @@ add_executable(bybit_client
         src/ch/ch_writer.cpp
 
         src/binance/binance_public_ws.cpp
-
+        src/true_price/true_price_engine.h
         src/symbol_regime.cpp
 )
 
@@ -103,6 +103,23 @@ target_link_libraries(bybit_client PRIVATE
         curl
         clickhouse-cpp-lib
         /opt/homebrew/opt/libpq/lib/libpq.5.dylib
+)
+
+add_executable(tp_shadow
+        src/tp_shadow/main.cpp
+)
+
+target_include_directories(tp_shadow PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/true_price/true_price
+)
+
+target_link_libraries(tp_shadow PRIVATE
+        clickhouse-cpp-lib
+        Boost::boost
+        Threads::Threads
+        OpenSSL::SSL
+        OpenSSL::Crypto
 )
 
 target_link_directories(bybit_client PRIVATE

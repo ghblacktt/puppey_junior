@@ -131,17 +131,29 @@ void BybitWSClient::init_mm_strategies(IExchange& exchange) {
 }
 
 void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
-    if (!exchange_) {
-        return;
-    }
+    if (!exchange_) return;
+
     auto it = tickers_.find(symbol);
-    if (it == tickers_.end()) {
-        return;
-    }
+    if (it == tickers_.end()) return;
     if (mm_strategies_.count(symbol) > 0) return;
 
     double px_hint = it->second->orderbook.get_mid_price();
-    if (px_hint <= 0.0) {
+    if (px_hint <= 0.0) return;
+
+    // ═══ WHITELIST: только эти символы торгуют в paper режиме ═══
+    static const std::set<std::string> kMomentumWhitelist = {
+            "XMRUSDT",
+            "TAOUSDT",
+            "ZECUSDT",
+            "HYPEUSDT",
+    };
+
+    bool is_momentum_sym = (kMomentumWhitelist.count(symbol) > 0);
+
+    // PAPER MODE: MM только на whitelist. Остальные 496 — data-only (CH-writer).
+    if (paper_exchange_ != nullptr && !is_momentum_sym) {
+        std::cout << "[MM] " << symbol
+                  << " skipped (paper: non-momentum)\n";
         return;
     }
 
@@ -167,7 +179,6 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
         qty_usd = std::clamp(min_qty_safe, 5.5, max_qty_safe);
     }
 
-    // ── min_hs ──
     double min_hs;
     if (sym_cfg.min_hs_bps > 0.0) {
         min_hs = sym_cfg.min_hs_bps / 10000.0;
@@ -183,17 +194,22 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
                          ? sym_cfg.base_spread_bps / 10000.0
                          : min_hs * 2.0;
 
-    // ── Создание MM ──
     auto mm = std::make_shared<MarketMakingStrategy>(
             it->second->orderbook, it->second->cluster, *exchange_,
             symbol, base_spread, qty_usd, max_position_usd);
     if (signal_engine_) {
         mm->set_signal_engine(signal_engine_.get());
     }
-// Определи, торгуется ли символ на Bitunix
     if (is_bitunix_symbol(symbol)) {
         mm->set_is_bitunix_symbol(true);
     }
+    if (!tp_engine_) {
+        tp_engine_ = std::make_unique<tp::TruePriceEngine>();
+        tp::TruePriceEngine::Config cfg;
+        cfg.max_skew_bps = 50.0;
+        tp_engine_->set_config(cfg);
+    }
+    mm->set_tp_engine(tp_engine_.get());
     mm->set_executor(pos_manage_timer_.get_executor());
     mm->set_maker_fee_bps(g.maker_fee_bps);
     mm->set_use_adaptive(true);
@@ -225,12 +241,18 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
         mm->set_max_hold_sec(sym_cfg.max_hold_sec);
     }
 
+    // ── Momentum mode ──
+    mm->set_momentum_mode(is_momentum_sym, /*qty_usd=*/100.0);
+
     std::cout << clr::green << "  ✓ " << clr::reset
               << pad_r(symbol, 14)
               << "$" << num(px_hint, 4)
               << "  half=" << num(min_hs * 10000, 1) << "bps"
-              << "  qty=$" << num(qty_usd, 0)
-              << "\n";
+              << "  qty=$" << num(qty_usd, 0);
+    if (is_momentum_sym) {
+        std::cout << "  " << clr::cyan << "⚡ MOMENTUM" << clr::reset;
+    }
+    std::cout << "\n";
 
     mm_strategies_[symbol] = std::move(mm);
 }
@@ -818,7 +840,15 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                     }
                     state.vwma.add_tick(price, sz, timestamp);
                     state.bb.add_tick(price, sz, timestamp);
-
+                    // ── Hawkes: Bybit trade -> tp_engine ──
+                    if (tp_engine_) {
+                        double bsz = state.orderbook.get_best_bid_size();
+                        double asz = state.orderbook.get_best_ask_size();
+                        double best_sz = std::max(1e-9, std::max(bsz, asz));
+                        double sz_norm = sz / best_sz;
+                        int side = is_buyer_maker ? 1 : 0;   // 1=sell, 0=buy
+                        tp_engine_->on_trade(0 /*bybit*/, side, sz_norm, ch::now_ms());
+                    }
                     // ── cross-venue signal: Bybit trade flow ──
                     if (signal_engine_) {
                         signal_engine_->on_bybit_trade(symbol, price, sz, is_buyer_maker);

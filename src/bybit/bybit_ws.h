@@ -26,6 +26,9 @@
 #include "bybit_private_ws.h"
 #include "mm_symbol_registry.h"
 #include "ch/ch_writer.h"
+#include "true_price/true_price_engine.h"
+
+
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace websocket = beast::websocket;
@@ -220,4 +223,5 @@ private:
     std::vector<char> json_buffer_;
     void create_mm_for_symbol(const std::string& symbol);
     IExchange* exchange_ = nullptr;
+    std::unique_ptr<tp::TruePriceEngine> tp_engine_;
 };

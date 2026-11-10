@@ -13,6 +13,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "true_price/true_price_engine.h"
 
 namespace net = boost::asio;
 namespace ssl = net::ssl;
@@ -24,7 +25,7 @@ class BinancePublicWS : public std::enable_shared_from_this<BinancePublicWS> {
 public:
     using BookCallback  = std::function<void(const std::string&, double, double, double, double)>;
     using TradeCallback = std::function<void(const std::string&, double, double, bool)>;
-
+    void set_tp_engine(tp::TruePriceEngine* e) { tp_engine_ = e; }
     BinancePublicWS(net::io_context& ioc, ssl::context& ctx,
                     const std::vector<std::string>& symbols);
     ~BinancePublicWS();
@@ -50,6 +51,8 @@ private:
         int  reconnect_attempts = 0;
         bool subscribed = false;
     };
+    std::unordered_map<std::string, double> last_bbo_sz_;
+    tp::TruePriceEngine* tp_engine_ = nullptr;
 
     std::string build_stream_path(const Connection& c) const;
 

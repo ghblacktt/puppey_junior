@@ -21,6 +21,7 @@
 #include "features/hma_filter.h"
 #include "features/kernel_filter.h"
 #include "symbol_regime.h"
+#include "true_price/true_price_engine.h"
 
 using arb::IExchange;
 class CrossVenueSignalEngine;
@@ -32,6 +33,8 @@ public:
         exec_ = std::move(exec);
         has_exec_ = true;
     }
+
+    void set_tp_engine(tp::TruePriceEngine* e) { tp_engine_ = e; }
 
     void cancel_ask_on_through(double trade_price, const std::string& reason);
     void cancel_bid_on_through(double trade_price, const std::string& reason);
@@ -214,6 +217,11 @@ public:
 
     std::vector<FinalizedMarkout> drain_finalized_markouts();
 
+    void set_momentum_mode(bool enabled, double qty_usd = 100.0) {
+        momentum_enabled_ = enabled;
+        momentum_qty_usd_ = qty_usd;
+    }
+
 private:
     HmaFilter    hma_fast_{8,  1000};   // 8 секунд, быстрый тренд
     HmaFilter    hma_slow_{32, 1000};   // 32 секунды, медленный тренд
@@ -349,4 +357,17 @@ private:
     void update_pending_markouts(uint64_t now);
     void persist_markout(const PendingMarkout& m);
     bool shutting_down_ = false;
+    tp::TruePriceEngine* tp_engine_ = nullptr;
+
+    bool     momentum_enabled_              = false;
+    bool     momentum_active_               = false;
+    double   momentum_skew_                 = 0.0;
+    uint64_t momentum_entry_ms_             = 0;
+    int      momentum_retry_                = 0;
+    uint64_t momentum_last_entry_attempt_ms_ = 0;   // ← cooldown
+    double   momentum_qty_usd_              = 100.0;
+    double   momentum_thr_                  = 10.0;
+    double   momentum_tp_bps_               = 5.0;
+    uint64_t momentum_max_ms_               = 10'000;
+    uint64_t momentum_cooldown_ms_          = 60'000;   // 60s между entries
 };

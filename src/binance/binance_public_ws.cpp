@@ -288,6 +288,14 @@ void BinancePublicWS::handle_agg_trade(const char* data, std::size_t size) {
 
     if (on_trade_) on_trade_(symbol, px, sz, is_buyer_maker);
 
+    if (tp_engine_) {
+        auto it_sz = last_bbo_sz_.find(symbol);
+        double best_sz = (it_sz != last_bbo_sz_.end()) ? it_sz->second : 1.0;
+        double sz_norm = sz / std::max(1e-9, best_sz);
+        int side = is_buyer_maker ? 1 : 0;
+        tp_engine_->on_trade(1 /*binance*/, side, sz_norm, ch::now_ms());
+    }
+
     if (ch_writer_) {
         // Use agg_id as stable trade_id
         uint64_t tid_hash = ch::fnv1a("binance|" + std::to_string(agg_id));
