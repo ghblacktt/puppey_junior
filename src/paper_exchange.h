@@ -19,7 +19,7 @@ namespace arb {
         struct Config {
             double initial_balance_usd   = 10000.0;
             double maker_fee_bps         = 2.0;
-            double taker_fee_bps         = 5.5;
+            double taker_fee_bps         = 0.0;
             double taker_slippage_bps    = 3.0;     // floor for market orders
             double touch_fill_volume_usd = 2000.0;  // legacy — used only if model_queue=false
             double max_position_usd      = 60.0;

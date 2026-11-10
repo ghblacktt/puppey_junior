@@ -140,20 +140,16 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     double px_hint = it->second->orderbook.get_mid_price();
     if (px_hint <= 0.0) return;
 
-    // ═══ WHITELIST: только эти символы торгуют в paper режиме ═══
     static const std::set<std::string> kMomentumWhitelist = {
             "XMRUSDT",
             "TAOUSDT",
             "ZECUSDT",
             "HYPEUSDT",
     };
-
     bool is_momentum_sym = (kMomentumWhitelist.count(symbol) > 0);
 
-    // PAPER MODE: MM только на whitelist. Остальные 496 — data-only (CH-writer).
     if (paper_exchange_ != nullptr && !is_momentum_sym) {
-        std::cout << "[MM] " << symbol
-                  << " skipped (paper: non-momentum)\n";
+        std::cout << "[MM] " << symbol << " skipped (paper: non-momentum)\n";
         return;
     }
 
@@ -166,50 +162,35 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     const double default_max_pos = (g.max_position_default_usd > 0.0)
                                    ? g.max_position_default_usd : 50.0;
     double max_position_usd = (sym_cfg.max_position_usd > 0.0)
-                              ? sym_cfg.max_position_usd
-                              : default_max_pos;
+                              ? sym_cfg.max_position_usd : default_max_pos;
     double step_notional = inst.step_size * px_hint;
     double min_qty_safe  = std::max(5.5, step_notional * 1.5);
     double max_qty_safe  = max_position_usd * 0.30;
 
     double qty_usd;
-    if (sym_cfg.qty_usd > 0.0) {
-        qty_usd = std::clamp(sym_cfg.qty_usd, 5.5, max_qty_safe);
-    } else {
-        qty_usd = std::clamp(min_qty_safe, 5.5, max_qty_safe);
-    }
+    if (sym_cfg.qty_usd > 0.0) qty_usd = std::clamp(sym_cfg.qty_usd, 5.5, max_qty_safe);
+    else qty_usd = std::clamp(min_qty_safe, 5.5, max_qty_safe);
 
     double min_hs;
-    if (sym_cfg.min_hs_bps > 0.0) {
-        min_hs = sym_cfg.min_hs_bps / 10000.0;
-    } else if (px_hint > 100.0) {
-        min_hs = 0.0005;
-    } else if (px_hint > 1.0) {
-        min_hs = 0.0010;
-    } else {
-        min_hs = 0.0020;
-    }
+    if (sym_cfg.min_hs_bps > 0.0) min_hs = sym_cfg.min_hs_bps / 10000.0;
+    else if (px_hint > 100.0)     min_hs = 0.0005;
+    else if (px_hint > 1.0)       min_hs = 0.0010;
+    else                          min_hs = 0.0020;
 
     double base_spread = (sym_cfg.base_spread_bps > 0.0)
-                         ? sym_cfg.base_spread_bps / 10000.0
-                         : min_hs * 2.0;
+                         ? sym_cfg.base_spread_bps / 10000.0 : min_hs * 2.0;
 
     auto mm = std::make_shared<MarketMakingStrategy>(
             it->second->orderbook, it->second->cluster, *exchange_,
             symbol, base_spread, qty_usd, max_position_usd);
-    if (signal_engine_) {
-        mm->set_signal_engine(signal_engine_.get());
-    }
-    if (is_bitunix_symbol(symbol)) {
-        mm->set_is_bitunix_symbol(true);
-    }
-    if (!tp_engine_) {
-        tp_engine_ = std::make_unique<tp::TruePriceEngine>();
-        tp::TruePriceEngine::Config cfg;
-        cfg.max_skew_bps = 50.0;
-        tp_engine_->set_config(cfg);
-    }
-    mm->set_tp_engine(tp_engine_.get());
+    if (signal_engine_) mm->set_signal_engine(signal_engine_.get());
+    if (is_bitunix_symbol(symbol)) mm->set_is_bitunix_symbol(true);
+// ── Per-symbol TruePriceEngine ──
+    auto tp = std::make_shared<tp::TruePriceEngine>();
+    tp::TruePriceEngine::Config tp_cfg;
+    tp_cfg.max_skew_bps = 50.0;
+    tp->set_config(tp_cfg);
+    mm->set_tp_engine(tp);
     mm->set_executor(pos_manage_timer_.get_executor());
     mm->set_maker_fee_bps(g.maker_fee_bps);
     mm->set_use_adaptive(true);
@@ -232,17 +213,15 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     mm->set_regime_filter(&it->second->regime_filter);
     mm->set_db_connection(mm_db_conn_);
 
-    if (paper_exchange_ != nullptr) {
-        mm->set_run_tag(paper_exchange_->run_tag());
-    }
+    if (paper_exchange_ != nullptr) mm->set_run_tag(paper_exchange_->run_tag());
     mm->set_momentum_weight(sym_cfg.momentum_weight > 0 ? sym_cfg.momentum_weight : 1.0);
+    if (sym_cfg.max_hold_sec > 0) mm->set_max_hold_sec(sym_cfg.max_hold_sec);
 
-    if (sym_cfg.max_hold_sec > 0) {
-        mm->set_max_hold_sec(sym_cfg.max_hold_sec);
-    }
-
-    // ── Momentum mode ──
+    // ═══ MOMENTUM: включить + TP=3 bps, hold=5s ═══
     mm->set_momentum_mode(is_momentum_sym, /*qty_usd=*/100.0);
+    if (is_momentum_sym) {
+        mm->set_momentum_tp(3.0, 5'000);
+    }
 
     std::cout << clr::green << "  ✓ " << clr::reset
               << pad_r(symbol, 14)
@@ -250,7 +229,7 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
               << "  half=" << num(min_hs * 10000, 1) << "bps"
               << "  qty=$" << num(qty_usd, 0);
     if (is_momentum_sym) {
-        std::cout << "  " << clr::cyan << "⚡ MOMENTUM" << clr::reset;
+        std::cout << "  " << clr::cyan << "⚡ MOMENTUM tp=3bp hold=5s" << clr::reset;
     }
     std::cout << "\n";
 
@@ -841,27 +820,19 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                     state.vwma.add_tick(price, sz, timestamp);
                     state.bb.add_tick(price, sz, timestamp);
                     // ── Hawkes: Bybit trade -> tp_engine ──
-                    if (tp_engine_) {
-                        double bsz = state.orderbook.get_best_bid_size();
-                        double asz = state.orderbook.get_best_ask_size();
-                        double best_sz = std::max(1e-9, std::max(bsz, asz));
-                        double sz_norm = sz / best_sz;
-                        int side = is_buyer_maker ? 1 : 0;   // 1=sell, 0=buy
-                        tp_engine_->on_trade(0 /*bybit*/, side, sz_norm, ch::now_ms());
-                    }
-                    // ── cross-venue signal: Bybit trade flow ──
-                    if (signal_engine_) {
-                        signal_engine_->on_bybit_trade(symbol, price, sz, is_buyer_maker);
-                    }
-
-                    // ── paper exchange trade handler ──
-                    if (paper_exchange_) {
-                        paper_exchange_->on_trade(symbol, price, sz, is_buyer_maker);
-                    }
-
-                    // ── toxic detection ──
+// Per-symbol: только этот MM получает трейды этого symbol
+                    // ── Per-symbol MM ──
                     auto mm_it = mm_strategies_.find(symbol);
                     if (mm_it != mm_strategies_.end() && mm_it->second) {
+                        auto* tp = mm_it->second->get_tp_engine();
+                        if (tp) {
+                            double bsz = state.orderbook.get_best_bid_size();
+                            double asz = state.orderbook.get_best_ask_size();
+                            double best_sz = std::max(1e-9, std::max(bsz, asz));
+                            double sz_norm = sz / best_sz;
+                            int side = is_buyer_maker ? 1 : 0;
+                            tp->on_trade(0 /*bybit*/, side, sz_norm, ch::now_ms());
+                        }
                         if (!is_buyer_maker) mm_it->second->on_trade_through_ask(price, sz);
                         else                 mm_it->second->on_trade_through_bid(price, sz);
                     }
