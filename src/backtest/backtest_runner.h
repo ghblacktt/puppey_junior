@@ -41,16 +41,21 @@ namespace bt {
     class BacktestRunner {
     public:
         BacktestRunner(const RunConfig& cfg, const InstrumentParams& inst);
-
         BacktestResult run(const std::vector<TimedEvent>& events);
 
     private:
-        RunConfig cfg_;
+        RunConfig        cfg_;
         InstrumentParams inst_;
-        MatchingEngine engine_;
-        OrderBook book_;
-        std::shared_ptr<MarketMakingStrategy> mm_;
+        MatchingEngine   engine_;
+        OrderBook        book_;
         std::unique_ptr<BacktestExchange> exchange_;
+        std::shared_ptr<MarketMakingStrategy> mm_;
+
+        ClusterEngine cluster_;
+        std::vector<MarketMakingStrategy::FinalizedMarkout> all_markouts_;
+        uint64_t last_regime_update_ms_ = 0;
+
+        void update_regime_inmemory(uint64_t now_ms);
     };
 
 }  // namespace bt

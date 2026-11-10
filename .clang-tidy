@@ -1,2 +1,8 @@
-Checks: '-*,modernize-*,performance-*,portability-*,cppcoreguidelines-*'
-HeaderFilterRegex: '.*/src/.*'
+Checks: >
+  -*,
+  bugprone-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  readability-*,
+  -readability-magic-numbers,          # ← отключаем
+  -readability-uppercase-literal-suffix

@@ -46,7 +46,7 @@ namespace bt {
     void BacktestExchange::apply_fill(const BtFill& f) {
         // SAFETY: если fill выводит позицию за max_position (например, из-за qty=inf)
         // — reject, чтобы не накапливать мусор
-        constexpr double kMaxPositionUsd = 60.0;   // hard cap
+        constexpr double kMaxPositionUsd = 500.0;   // hard cap
         double new_qty = pos_.signed_qty + ((f.side == "Buy") ? 1.0 : -1.0) * f.qty;
         double new_notional = std::abs(new_qty) * f.price;
         if (new_notional > kMaxPositionUsd * 1.5) {
@@ -90,8 +90,9 @@ namespace bt {
         }
 
         BtOrder o;
+        static std::atomic<uint64_t> order_seq{0};
         o.order_id = "BT_" + std::to_string(current_ts_) + "_" +
-                     std::to_string(engine_.open_order_count() + 1);
+                     std::to_string(order_seq.fetch_add(1));
         o.symbol = s;
         o.side = side;
         o.type = "Limit";
@@ -104,7 +105,7 @@ namespace bt {
             last_ret_msg_ = "invalid qty";
             return "";
         }
-        if (qty * px > 500.0) {   // notional > $10k — явно баг
+        if (qty * px > 1500.0) {   // notional > $10k — явно баг
             static int big_qty_count = 0;
             if (big_qty_count < 10) {
                 std::cerr << "[BT-SAFETY] reject huge order: qty=" << qty

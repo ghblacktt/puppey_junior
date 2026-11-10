@@ -22,15 +22,8 @@ namespace bt {
             }
         });
 
-        // Создаём MM
-        ClusterEngine dummy_cluster;
-        (void)dummy_cluster;  // MM требует cluster - создаём пустой
-
-        // TODO: передать реальный cluster если нужно для VPIN
-        // Пока создаём заглушку
-        static ClusterEngine stub_cluster;
         mm_ = std::make_shared<MarketMakingStrategy>(
-                book_, stub_cluster, *exchange_,
+                book_, cluster_, *exchange_,
                 cfg_.symbol, cfg_.base_spread_bps / 10000.0,
                 cfg_.qty_usd, cfg_.max_position_usd);
 
@@ -52,7 +45,7 @@ namespace bt {
         mm_->set_hard_cap_ratio(0.85);
         mm_->set_block_ratio(0.10);
         mm_->set_gamma(10.0);
-        mm_->set_vpin_thresholds(0.85, 0.60);
+        mm_->set_vpin_thresholds(0.99, 0.98);
         mm_->set_soft_exit_pnl_pct(0.01);
         mm_->set_soft_exit_ratio(0.15);
         mm_->set_momentum_weight(cfg_.momentum_weight);
@@ -64,8 +57,32 @@ namespace bt {
         r.total_events = events.size();
         if (events.empty()) return r;
 
+
         r.first_ts = events.front().timestamp_ms;
         r.last_ts  = events.back().timestamp_ms;
+
+        // ── Sprint 3: forced regime для A/B-сравнения ──
+        if (cfg_.force_regime_toxic) {
+            mm::SymModeSnapshot snap;
+            snap.bid.mode = mm::SymMode::Toxic;
+            snap.ask.mode = mm::SymMode::Toxic;
+            snap.bid.n_markouts_4h = 30;
+            snap.ask.n_markouts_4h = 30;
+            snap.bid.hit_pct_1s = 20.0;
+            snap.ask.hit_pct_1s = 20.0;
+            snap.has_data = true;
+            snap.updated_ms = r.first_ts;
+            mm_->set_regime_snapshot(snap);
+            std::cout << "[BT] FORCED regime: Toxic/Toxic\n";
+        } else if (cfg_.force_regime_illiquid) {
+            mm::SymModeSnapshot snap;
+            snap.bid.mode = mm::SymMode::Illiquid;
+            snap.ask.mode = mm::SymMode::Illiquid;
+            snap.has_data = true;
+            snap.updated_ms = r.first_ts;
+            mm_->set_regime_snapshot(snap);
+            std::cout << "[BT] FORCED regime: Illiquid/Illiquid\n";
+        }
 
         // Переопределяем fill callback чтобы считать fills в r
         exchange_->set_fill_callback([this, &r](const BtFill& f) {
@@ -88,7 +105,12 @@ namespace bt {
             if (ev.type == TimedEvent::BOOK) {
                 ++r.book_events;
                 std::string err;
-                if (!BookRebuilder::apply(book_, ev.book, &err)) continue;
+                if (!BookRebuilder::apply(book_, ev.book, &err)) {
+                    // Даже если книга невалидна — активируем pending,
+                    // иначе ордер может зависнуть в Pending навсегда
+                    exchange_->process_pending_orders();
+                    continue;
+                }
 
                 // Sanity: книга валидная?
                 double bb = book_.get_best_bid();
@@ -123,6 +145,16 @@ namespace bt {
                         auto finalized = mm_->drain_finalized_markouts();
                         for (auto& m : finalized) {
                             r.markouts.push_back(m);
+                            all_markouts_.push_back(m);
+                        }
+                        // Periodic regime update (каждые 5 мин sim-времени),
+                        // только если не принудительный режим
+                        if (!cfg_.force_regime_toxic && !cfg_.force_regime_illiquid) {
+                            if (last_regime_update_ms_ == 0
+                                || ev.timestamp_ms - last_regime_update_ms_ >= 300'000) {
+                                update_regime_inmemory(ev.timestamp_ms);
+                                last_regime_update_ms_ = ev.timestamp_ms;
+                            }
                         }
                     } catch (const std::exception& e) {
                         std::cerr << "[MM-EXC] " << e.what() << "\n";
@@ -139,7 +171,12 @@ namespace bt {
                 }
             } else {
                 ++r.trade_events;
-                // ═══ MM toxic detection — как в live bybit_ws.cpp ═══
+                exchange_->process_pending_orders();
+                cluster_.add_historical_trade(
+                        ev.timestamp_ms, ev.trade.price, ev.trade.volume,
+                        ev.trade.is_buyer_maker);
+
+                // ── MM toxic detection ──
                 if (mm_) {
                     if (!ev.trade.is_buyer_maker)
                         mm_->on_trade_through_ask(ev.trade.price, ev.trade.volume);
@@ -173,6 +210,86 @@ namespace bt {
         r.net_pnl = r.realized_pnl - r.total_fees;
 
         return r;
+    }
+
+    void BacktestRunner::update_regime_inmemory(uint64_t now_ms) {
+        if (!mm_) return;
+
+        constexpr uint64_t kWindowMs = 4 * 3600 * 1000;
+        uint64_t cutoff = (now_ms > kWindowMs) ? (now_ms - kWindowMs) : 0;
+
+        struct SideAcc {
+            int    n         = 0;
+            double sum_mk_1s = 0.0;
+            double sum_mk_30s= 0.0;
+            int    n_hit_1s  = 0;
+        };
+        SideAcc buy_acc, sell_acc;
+
+        for (const auto& m : all_markouts_) {
+            if (!m.finalized) continue;
+            if (m.fill_time_ms < cutoff) continue;
+
+            SideAcc* acc = (m.side == "Buy") ? &buy_acc : &sell_acc;
+            acc->n++;
+            acc->sum_mk_1s  += m.mk_1s_bps;
+            acc->sum_mk_30s += m.mk_30s_bps;
+            if (m.mk_1s_bps > 0.0) acc->n_hit_1s++;
+        }
+
+        // Market-derived
+        double depth_usdt = 0.0, spread_frac = 0.0, vpin = 0.0;
+        {
+            double bb = book_.get_best_bid();
+            double ba = book_.get_best_ask();
+            double bs = book_.get_best_bid_size();
+            double as = book_.get_best_ask_size();
+            if (bb > 0 && ba > 0) {
+                double mid = (bb + ba) / 2.0;
+                depth_usdt  = std::min(bs * bb, as * ba) * 5.0;
+                spread_frac = (ba - bb) / mid;
+            }
+            vpin = cluster_.get_vpin(20);
+        }
+
+        mm::SymModeSnapshot snap;
+
+        auto fill_side = [](mm::SymModeSide& s, const SideAcc& a) {
+            s.n_markouts_4h = a.n;
+            if (a.n > 0) {
+                s.med_mk_1s  = a.sum_mk_1s  / a.n;
+                s.med_mk_30s = a.sum_mk_30s / a.n;
+                s.hit_pct_1s = 100.0 * a.n_hit_1s / a.n;
+            }
+        };
+        fill_side(snap.bid, buy_acc);
+        fill_side(snap.ask, sell_acc);
+
+        snap.bid.mode = mm::classify_side(snap.bid, depth_usdt, spread_frac, vpin);
+        snap.ask.mode = mm::classify_side(snap.ask, depth_usdt, spread_frac, vpin);
+
+        const auto& prev = mm_->regime();
+        snap.bid = mm::apply_hysteresis(prev.bid, snap.bid, now_ms);
+        snap.ask = mm::apply_hysteresis(prev.ask, snap.ask, now_ms);
+
+        snap.depth_usdt  = depth_usdt;
+        snap.spread_frac = spread_frac;
+        snap.vpin_now    = vpin;
+        snap.updated_ms  = now_ms;
+        snap.has_data    = (buy_acc.n >= 20) || (sell_acc.n >= 20);
+
+        mm_->set_regime_snapshot(snap);
+
+        std::cout << "[BT-REGIME] " << cfg_.symbol
+                  << " bid:" << mm::to_str(snap.bid.mode)
+                  << "(n=" << snap.bid.n_markouts_4h
+                  << ",hit=" << std::fixed << std::setprecision(1)
+                  << snap.bid.hit_pct_1s << "%)"
+                  << " ask:" << mm::to_str(snap.ask.mode)
+                  << "(n=" << snap.ask.n_markouts_4h
+                  << ",hit=" << snap.ask.hit_pct_1s << "%)"
+                  << " vpin=" << std::setprecision(2) << vpin
+                  << std::defaultfloat << "\n";
     }
 
 }  // namespace bt

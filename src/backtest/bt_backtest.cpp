@@ -10,9 +10,11 @@
 
 
 int main(int argc, char** argv) {
+    load_dotenv();
     if (argc < 2) {
         std::cerr << "Usage: bt_backtest SYMBOL [--hours N] "
-                     "[--min-hs N] [--qty N] [--hold N] [--momentum-weight N]\n";
+                     "[--min-hs N] [--qty N] [--hold N] [--momentum-weight N] "
+                     "[--force-regime normal|toxic|illiquid]\n";
         return 1;
     }
 
@@ -32,6 +34,11 @@ int main(int argc, char** argv) {
         else if (k == "--qty")         cfg.qty_usd = std::stod(v);
         else if (k == "--hold")        cfg.max_hold_sec = std::stoi(v);
         else if (k == "--momentum-weight") cfg.momentum_weight = std::stod(v);
+        else if (k == "--force-regime") {
+            if      (v == "toxic")    cfg.force_regime_toxic    = true;
+            else if (v == "illiquid") cfg.force_regime_illiquid = true;
+            else if (v == "normal")   { /* default */ }
+        }
         else if (k == "--base-spread") cfg.base_spread_bps = std::stod(v);
     }
 

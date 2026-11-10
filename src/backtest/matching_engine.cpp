@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <iostream>
 #include <cmath>
-
 namespace bt {
 
     MatchingEngine::MatchingEngine() {
@@ -47,14 +46,22 @@ namespace bt {
         double price_gap = is_buy ? (best_bid - ord.price) : (ord.price - best_ask);
         double best_size = is_buy ? bid_size : ask_size;
 
+        // ═══ DIAGNOSTIC: queue_ahead = 0 — временно для проверки fills ═══
+        // Если fills появятся — подтвердим, что queue model слишком строгая.
+        // Потом откалибруем под реальный best_size из raw_books.
         if (price_gap < 0.0) {
-            ord.queue_ahead = 0.0;   // cross — taker
+            ord.queue_ahead = 0.0;   // cross — taker, fill немедленно
         } else {
             double gap_ticks = price_gap / tick_est;
-            if (gap_ticks < 0.5)       ord.queue_ahead = best_size * 1.0;    // на best_bid
-            else if (gap_ticks < 1.5)  ord.queue_ahead = best_size * 0.5;    // 1 tick
-            else if (gap_ticks < 3.5)  ord.queue_ahead = best_size * 0.15;   // 2-3 tick
-            else                       ord.queue_ahead = best_size * 0.03;   // 4+ tick — почти пусто
+            if (gap_ticks < 0.5) {
+                ord.queue_ahead = best_size * 0.7;    // на BBO — конкурируем
+            } else if (gap_ticks < 1.5) {
+                ord.queue_ahead = best_size * 0.02;   // 1 tick глубже — sweep
+            } else if (gap_ticks < 3.5) {
+                ord.queue_ahead = best_size * 0.02;
+            } else {
+                ord.queue_ahead = best_size * 0.005;
+            }
         }
 
         ord.placed_ts = now_ts + random_latency();
@@ -153,6 +160,23 @@ namespace bt {
             if (o.status != "Open") continue;
             if (o.filled_qty >= o.qty - 1e-9) continue;
 
+            static int check_n = 0;
+            if (check_n < 100) {
+                bool is_buy_ = (o.side == "Buy");
+                double gap = is_buy_ ? (trade.price - o.price) : (o.price - trade.price);
+                std::cout << std::fixed
+                          << "[ENG-CHECK-" << (++check_n) << "] "
+                          << oid << " " << o.side
+                          << " o.px=" << o.price
+                          << " trade.px=" << trade.price
+                          << " gap=" << gap
+                          << (gap > 0 ? " HIT" : " miss")
+                          << "\n";
+            }
+
+            if (o.status != "Open") continue;
+            if (o.filled_qty >= o.qty - 1e-9) continue;
+
             bool is_buy = (o.side == "Buy");
 
             // Buy — fill только если trade цена <= наш bid (рынок пробил вниз)
@@ -168,13 +192,32 @@ namespace bt {
             }
             if (!hit) continue;
 
+            // ═══ DEBUG: сколько раз трейд дошёл до нашего ордера ═══
+            // ═══ DEBUG ═══
+            static int64_t hits_total = 0;
+            ++hits_total;
+
+            double q_before = o.queue_ahead;
+
             // 1) Сначала съедаем queue_ahead
             if (o.queue_ahead > 0.0) {
                 double consumed = std::min(o.queue_ahead, trade_remaining);
                 o.queue_ahead -= consumed;
                 trade_remaining -= consumed;
+
+                if (hits_total <= 30 && hits_total % 3 == 0) {
+                    std::cout << "[ENG-HIT-" << hits_total << "] "
+                              << o.order_id << " " << o.side
+                              << " q_before=" << q_before
+                              << " consumed=" << consumed
+                              << " q_after="  << o.queue_ahead
+                              << " trade_rem=" << trade_remaining << "\n";
+                }
+
                 if (trade_remaining <= 1e-9) continue;
             }
+
+            // 2) Теперь наш ордер получает fill
 
             // 2) Теперь наш ордер получает fill
             double our_remaining = o.qty - o.filled_qty;

@@ -12,12 +12,22 @@ namespace bt {
             return false;
         }
 
-        // Строим snapshot JSON с BBO
         std::stringstream ss;
-        ss << "{\"u\":" << update.update_id << ",\"b\":[[\""
-           << std::fixed << std::setprecision(8) << update.bids[0].price
-           << "\",\"" << update.bids[0].size << "\"]],\"a\":[[\""
-           << update.asks[0].price << "\",\"" << update.asks[0].size << "\"]]}";
+        ss << "{\"u\":" << update.update_id << ",\"b\":[";
+        size_t nb = std::min<size_t>(update.bids.size(), 50);
+        for (size_t i = 0; i < nb; ++i) {
+            if (i > 0) ss << ",";
+            ss << "[\"" << std::fixed << std::setprecision(8) << update.bids[i].price
+               << "\",\"" << update.bids[i].size << "\"]";
+        }
+        ss << "],\"a\":[";
+        size_t na = std::min<size_t>(update.asks.size(), 50);
+        for (size_t i = 0; i < na; ++i) {
+            if (i > 0) ss << ",";
+            ss << "[\"" << update.asks[i].price
+               << "\",\"" << update.asks[i].size << "\"]";
+        }
+        ss << "]}";
 
         simdjson::dom::parser parser;
         simdjson::dom::element doc;
@@ -26,11 +36,9 @@ namespace bt {
             return false;
         }
 
-        // Всегда snapshot → book пересобирается заново
         book.update(doc, "snapshot");
         book.set_last_update_ms(update.timestamp_ms);
 
-        // Валидация
         double bb = book.get_best_bid();
         double ba = book.get_best_ask();
         if (bb <= 0.0 || ba <= 0.0 || bb >= ba) {

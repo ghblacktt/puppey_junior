@@ -8,16 +8,23 @@ namespace mm {
                           double spread_frac,
                           double vpin_now)
     {
-        if (s.n_markouts_4h < 20) return SymMode::Normal;
+        // ── Warm-up: экстремальные случаи ловим раньше ──
+        if (s.n_markouts_4h < 10) return SymMode::Normal;
 
+        if (s.n_markouts_4h < 20) {
+            // 10..19 fills — только абсолютно очевидные
+            if (s.hit_pct_1s < 15.0)  return SymMode::Toxic;   // hit 0-14% — катастрофа
+            if (s.med_mk_1s  < -10.0) return SymMode::Toxic;   // mk -10 bps — fat tail
+            return SymMode::Normal;
+        }
+
+        // ── n >= 20: полная логика ──
         const double spread_bps = spread_frac * 10000.0;
 
-        // Illiquid: маленькая глубина или очень широкая рыночная вилка
         if (depth_usdt < 50'000.0 || spread_bps > 15.0) {
             return SymMode::Illiquid;
         }
 
-        // Toxic: узкая вилка + плохие fills по этой стороне
         const bool toxic =
                 s.hit_pct_1s  < 30.0
                 || s.med_mk_1s   < -2.0
@@ -25,7 +32,6 @@ namespace mm {
                 || vpin_now      > 0.75;
         if (toxic) return SymMode::Toxic;
 
-        // Tier1: очень ликвидный, чистый markout обеих сторон (проверяется per side)
         if (depth_usdt > 500'000.0
             && spread_bps < 5.0
             && s.hit_pct_1s >= 40.0

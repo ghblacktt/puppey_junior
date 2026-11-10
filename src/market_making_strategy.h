@@ -142,7 +142,7 @@ public:
     MarketMakingStrategy(OrderBook& orderbook,
                          ClusterEngine& cluster,
                          IExchange& exchange,
-                         const std::string& symbol,
+                         std::string  symbol,
                          double base_spread_pct   = 0.002,
                          double order_qty_usd     = 15.0,
                          double max_position_usd  = 60.0);

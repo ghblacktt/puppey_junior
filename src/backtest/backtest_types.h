@@ -48,7 +48,8 @@ namespace bt {
         std::string symbol;
         uint64_t    from_ts_ms = 0;
         uint64_t    to_ts_ms   = 0;
-
+        bool   force_regime_toxic = false;
+        bool   force_regime_illiquid = false;
         // MM параметры
         double  base_spread_bps = 12.0;
         double  qty_usd = 5.5;
