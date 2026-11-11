@@ -36,7 +36,7 @@ namespace arb {
     void PaperExchange::schedule_fill(const ExchangeExecution& exec, int latency_ms) {
         auto timer = std::make_shared<boost::asio::steady_timer>(ioc_);
         timer->expires_after(std::chrono::milliseconds(latency_ms));
-        auto fill_cb = on_fill_;   // copy, безопасно при последующей замене cb
+        auto fill_cb = on_fill_;
 
         timer->async_wait([timer, exec, fill_cb](boost::system::error_code ec) {
             if (ec) return;
@@ -91,7 +91,6 @@ namespace arb {
                     bool hit_touch   = std::abs(px - o.price) < 1e-12;
 
                     if (hit_through) {
-                        // трейд прошёл через наш уровень — очередь съедена
                         o.queue_ahead = 0.0;
                         fill_qty = std::min(qty, o.qty - o.filled_qty);
                     } else if (hit_touch) {
@@ -104,7 +103,6 @@ namespace arb {
                         continue;
                     }
                 } else {
-                    // legacy touch model
                     bool hit_through = is_buy ? (px < o.price) : (px > o.price);
                     bool hit_touch   = std::abs(px - o.price) < 1e-9;
                     if (!hit_through && !hit_touch) continue;
@@ -118,7 +116,6 @@ namespace arb {
 
                 if (fill_qty <= 1e-12) continue;
 
-                // position limit
                 auto& pos = positions_[sym];
                 double cur_notional = std::abs(pos.signed_qty * o.price);
                 if (cur_notional + o.qty * o.price > cfg_.max_position_usd) {
@@ -153,7 +150,6 @@ namespace arb {
             return is_buy ? best * (1.0 + slip) : best * (1.0 - slip);
         }
 
-        // walk-the-book, но только по BBO size (без топ-N)
         if (best_size <= 1e-12 || qty <= best_size) {
             return best;
         }
@@ -164,7 +160,7 @@ namespace arb {
     }
 
     // ============================================================
-    // Fill application (locked)
+    // Fill application (locked) — с полным логом
     // ============================================================
     void PaperExchange::apply_fill_locked(POrder& o, double px, double qty, bool is_maker,
                                           std::vector<ExchangeExecution>& out_execs) {
@@ -199,8 +195,24 @@ namespace arb {
         double sign    = (o.side == "Buy") ? 1.0 : -1.0;
         double new_qty = old_qty + sign * qty;
 
+        // ═══ CLOSE detection (противоположный знак = закрытие) ═══
+        bool is_close_fill = (std::abs(old_qty) > 1e-9)
+                             && (std::signbit(old_qty) != std::signbit(sign));
+
         double realized_leg = 0.0;
-        if (std::abs(old_qty) > 1e-9 && std::signbit(old_qty) != std::signbit(sign)) {
+        double entry_px_logged = 0.0;
+        double closed_qty_logged = 0.0;
+        if (!is_close_fill) {
+            std::cout << "[PAPER-OPEN] " << o.symbol << " " << o.side
+                      << " px=" << std::fixed << std::setprecision(4) << px
+                      << " qty=" << qty
+                      << " notional=$" << std::setprecision(2) << notional
+                      << " fee=$" << std::setprecision(4) << fee
+                      << " is_maker=" << (is_maker ? "1" : "0")
+                      << std::defaultfloat << "\n";
+        }
+        if (is_close_fill) {
+
             double closed_qty = std::min(std::abs(old_qty), qty);
             double entry_px   = pos.avg_price;
             realized_leg = (o.side == "Buy")
@@ -208,6 +220,8 @@ namespace arb {
                            : (px - entry_px) * closed_qty;
             realized_pnl_ += realized_leg;
             pos.realized_pnl += realized_leg;
+            entry_px_logged = entry_px;
+            closed_qty_logged = closed_qty;
         }
 
         if (std::abs(new_qty) > 1e-9 && std::signbit(new_qty) == std::signbit(sign)) {
@@ -222,11 +236,21 @@ namespace arb {
         balance_usd_ += realized_leg - fee;
         fees_paid_   += fee;
 
-        if (std::abs(realized_leg) > 0.0) {
-            std::cout << "[REALIZED] " << o.symbol << " " << o.side
-                      << " leg=$" << std::fixed << std::setprecision(4) << realized_leg
+        // ═══ ЛОГ: каждый close показывает entry, exit, leg, fees, totals ═══
+        if (is_close_fill) {
+            double bps = (entry_px_logged > 0.0)
+                         ? ((px - entry_px_logged) / entry_px_logged * 10000.0 * sign_fill * -1)
+                         : 0.0;
+            std::cout << "[PAPER-CLOSE] " << o.symbol << " " << o.side
+                      << " entry=" << std::fixed << std::setprecision(4) << entry_px_logged
+                      << " exit=" << px
+                      << " qty=" << closed_qty_logged
+                      << " leg=$" << std::setprecision(6) << realized_leg
                       << " fee=$" << fee
-                      << " bal_after=$" << balance_usd_
+                      << " bps=" << std::setprecision(2) << bps
+                      << " | total_realized=$" << realized_pnl_
+                      << " total_fees=$" << fees_paid_
+                      << " bal=$" << balance_usd_
                       << std::defaultfloat << "\n";
         }
 
@@ -290,26 +314,24 @@ namespace arb {
             bool is_buy = (side == "Buy");
             if (is_buy) {
                 if (std::abs(px - bbo.bid) < 1e-12) {
-                    // На топе: мы быстрые HFT, стоим за 20% объёма (не в хвосте)
-                    o.queue_ahead = bbo.bid_size * 0.2;
+                    o.queue_ahead = bbo.bid_size * 0.02;
                 }
                 else if (px > bbo.bid) o.queue_ahead = 0.0;
                 else                   o.queue_ahead = std::max(1.0 * bbo.bid_size, 1.0);
             } else {
                 if (std::abs(px - bbo.ask) < 1e-12) {
-                    o.queue_ahead = bbo.ask_size * 0.2;
+                    o.queue_ahead = bbo.ask_size * 0.02;
                 }
                 else if (px < bbo.ask) o.queue_ahead = 0.0;
                 else                   o.queue_ahead = std::max(1.0 * bbo.ask_size, 1.0);
             }
 
-            // Aggressive limit → immediate taker
             bool aggressive = false;
             double fill_px = 0.0;
             if (is_buy && bbo.ask > 0 && px + 1e-12 >= bbo.ask) {
                 aggressive = true;
                 fill_px = estimate_market_price_locked(sym, "Buy", qty);
-                if (fill_px > px) fill_px = px;   // лимит ограничивает
+                if (fill_px > px) fill_px = px;
             } else if (!is_buy && bbo.bid > 0 && px - 1e-12 <= bbo.bid) {
                 aggressive = true;
                 fill_px = estimate_market_price_locked(sym, "Sell", qty);
@@ -465,39 +487,51 @@ namespace arb {
         return balance_usd_;
     }
 
+    // ============================================================
+    // Snapshot — 4 знака, все totals сходятся
+    // ============================================================
     void PaperExchange::print_snapshot() const {
         std::lock_guard lk(mtx_);
-        std::cout << std::fixed << std::setprecision(2);
-        std::cout << "[PAPER] balance=$" << balance_usd_
-                  << "  realized=$" << realized_pnl_
-                  << "  fees=$" << fees_paid_
-                  << "  positions=" << positions_.size()
-                  << "  orders=" << orders_.size() << "\n";
-        std::cout << std::setprecision(8);   // ← важно для мелких монет
+
+        double pos_realized_sum = 0.0;
+        int open_pos_count = 0;
+        for (auto& [sym, p] : positions_) {
+            if (std::abs(p.signed_qty) < 1e-9) continue;
+            pos_realized_sum += p.realized_pnl;
+            ++open_pos_count;
+        }
+
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout << "[PAPER] bal=$" << balance_usd_
+                  << " | realized=$" << realized_pnl_
+                  << " | fees=$" << fees_paid_
+                  << " | pos=" << open_pos_count
+                  << " | pos_realized_sum=$" << pos_realized_sum
+                  << " | orders=" << orders_.size() << "\n";
+
+        std::cout << std::setprecision(8);
         for (auto& [sym, p] : positions_) {
             if (std::abs(p.signed_qty) < 1e-9) continue;
             std::cout << "  POS " << sym << " qty=" << p.signed_qty
                       << " avg=" << p.avg_price
-                      << " realized=" << p.realized_pnl << "\n";
+                      << " realized=$" << p.realized_pnl << "\n";
         }
         std::cout << std::defaultfloat;
     }
 
     int PaperExchange::close_orphan_positions(const std::set<std::string>& active_symbols) {
-        // 1) Собираем orphan'ы (позиции не в active_symbols)
         std::vector<std::pair<std::string, double>> orphans;
         {
             std::lock_guard lk(mtx_);
             for (const auto& [sym, p] : positions_) {
                 if (std::abs(p.signed_qty) < 1e-9) continue;
-                if (active_symbols.count(sym)) continue;   // торгуется — не orphan
+                if (active_symbols.count(sym)) continue;
                 orphans.emplace_back(sym, p.signed_qty);
             }
         }
 
         if (orphans.empty()) return 0;
 
-        // 2) Закрываем каждый через market
         int closed = 0;
         for (const auto& [sym, qty] : orphans) {
             std::string side = (qty > 0) ? "Sell" : "Buy";

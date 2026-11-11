@@ -206,11 +206,11 @@ int main() {
 
     PaperExchange::Config cfg;
     cfg.initial_balance_usd   = 10000.0;
-    cfg.maker_fee_bps         = 2.0;
-    cfg.taker_fee_bps         = 5.5;
+    cfg.maker_fee_bps         = 0.0;
+    cfg.taker_fee_bps         = 0.0;
     cfg.taker_slippage_bps    = 3.0;
     cfg.touch_fill_volume_usd = 2000.0;
-    cfg.max_position_usd      = 60.0;
+    cfg.max_position_usd      = 200.0;
 
     net::io_context exec_ioc;
     auto paper = std::make_unique<PaperExchange>(*api, exec_ioc, cfg);

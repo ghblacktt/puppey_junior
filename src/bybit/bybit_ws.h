@@ -113,6 +113,8 @@ public:
     }
     void start_mm_tick();
 private:
+    void scan_momentum_candidates();
+    uint64_t last_momentum_scan_ms_ = 0;
     void start_regime_update();
     void do_regime_update();
     net::steady_timer regime_update_timer_;

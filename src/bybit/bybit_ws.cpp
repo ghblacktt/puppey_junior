@@ -141,10 +141,11 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     if (px_hint <= 0.0) return;
 
     static const std::set<std::string> kMomentumWhitelist = {
-            "XMRUSDT",
-            "TAOUSDT",
-            "ZECUSDT",
-            "HYPEUSDT",
+            "XMRUSDT", "TAOUSDT", "ZECUSDT", "HYPEUSDT",
+            "ARBUSDT", "OPUSDT", "SUIUSDT", "APTUSDT",
+            "SEIUSDT", "TIAUSDT", "INJUSDT", "NEARUSDT",
+            "DOGEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
+            "ORDIUSDT", "ARKMUSDT", "WLDUSDT", "JUPUSDT",
     };
     bool is_momentum_sym = (kMomentumWhitelist.count(symbol) > 0);
 
@@ -189,6 +190,11 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     auto tp = std::make_shared<tp::TruePriceEngine>();
     tp::TruePriceEngine::Config tp_cfg;
     tp_cfg.max_skew_bps = 50.0;
+// decay=1.0 → half-life 693ms → impact живёт между tick(100ms)
+    tp_cfg.amplitude[0][0] = 1.5;  tp_cfg.amplitude[0][1] = 1.5;
+    tp_cfg.amplitude[1][0] = 1.5;  tp_cfg.amplitude[1][1] = 1.5;
+    tp_cfg.decay[0][0] = 1.0;  tp_cfg.decay[0][1] = 1.0;
+    tp_cfg.decay[1][0] = 1.0;  tp_cfg.decay[1][1] = 1.0;
     tp->set_config(tp_cfg);
     mm->set_tp_engine(tp);
     mm->set_executor(pos_manage_timer_.get_executor());
@@ -221,6 +227,7 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     mm->set_momentum_mode(is_momentum_sym, /*qty_usd=*/100.0);
     if (is_momentum_sym) {
         mm->set_momentum_tp(3.0, 5'000);
+        mm->set_momentum_threshold(3.0);
     }
 
     std::cout << clr::green << "  ✓ " << clr::reset
@@ -277,6 +284,15 @@ void BybitWSClient::start_pos_manage() {
             uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
             signal_engine_->drain(now_ms);
+
+            // ── Momentum scanner (раз в 500ms) ──
+            {
+                uint64_t now_scan = ch::now_ms();
+                if (now_scan - last_momentum_scan_ms_ > 500) {
+                    last_momentum_scan_ms_ = now_scan;
+                    scan_momentum_candidates();
+                }
+            }
         }
         for (auto& [sym, mm] : mm_strategies_) {
             if (!mm) continue;
@@ -831,7 +847,16 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                             double best_sz = std::max(1e-9, std::max(bsz, asz));
                             double sz_norm = sz / best_sz;
                             int side = is_buyer_maker ? 1 : 0;
-                            tp->on_trade(0 /*bybit*/, side, sz_norm, ch::now_ms());
+                            tp->on_trade(0, side, sz_norm, ch::now_ms());
+
+                            static std::unordered_map<std::string, int> _tc;
+                            if ((++_tc[symbol] % 50) == 0) {
+                                std::cout << "[TP-TRADE] " << symbol
+                                          << " n=" << _tc[symbol]
+                                          << " sz_norm=" << std::fixed << std::setprecision(3) << sz_norm
+                                          << " skew=" << std::setprecision(2) << tp->target_skew_bps(ch::now_ms())
+                                          << std::defaultfloat << "\n";
+                            }
                         }
                         if (!is_buyer_maker) mm_it->second->on_trade_through_ask(price, sz);
                         else                 mm_it->second->on_trade_through_bid(price, sz);
@@ -1371,6 +1396,62 @@ void BybitWSClient::do_regime_update() {
               << " Toxic="    << ask_modes[2]
               << " Illiquid=" << ask_modes[3]
               << "\n";
+}
+
+
+// ============================================================
+// Momentum scanner — top-K ranking по expected value
+// ============================================================
+void BybitWSClient::scan_momentum_candidates() {
+    uint64_t now = ch::now_ms();
+
+    std::vector<MarketMakingStrategy::MomentumSignal> candidates;
+    candidates.reserve(mm_strategies_.size());
+
+    for (auto& [sym, mm] : mm_strategies_) {
+        if (!mm || !mm->is_momentum_enabled()) continue;
+        auto sig = mm->compute_momentum_signal(now);
+        if (sig.is_valid && sig.score_bps > 0.0) {
+            candidates.push_back(sig);
+        }
+    }
+
+    // Сортируем по score_bps desc
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) { return a.score_bps > b.score_bps; });
+
+    // Top-K
+    constexpr size_t K_MAX = 10;
+    std::set<std::string> selected;
+    for (size_t i = 0; i < std::min(K_MAX, candidates.size()); ++i) {
+        selected.insert(candidates[i].symbol);
+    }
+
+    // Установить флаг на каждом MM
+    for (auto& [sym, mm] : mm_strategies_) {
+        if (!mm || !mm->is_momentum_enabled()) continue;
+        mm->set_momentum_selected(selected.count(sym) > 0);
+    }
+
+    // Лог (не чаще раз в 5s)
+    static uint64_t _last_log = 0;
+    if (now - _last_log > 5'000) {
+        _last_log = now;
+        std::cout << "[SCAN] candidates=" << candidates.size()
+                  << " selected=" << selected.size() << "\n";
+        for (size_t i = 0; i < std::min<size_t>(5, candidates.size()); ++i) {
+            const auto& c = candidates[i];
+            std::cout << "  #" << (i + 1) << " " << c.symbol
+                      << " " << (c.side > 0 ? "BUY " : "SELL")
+                      << " hawkes=" << std::fixed << std::setprecision(1) << c.hawkes_bps
+                      << " spread=" << std::setprecision(1) << c.spread_ticks << "t"
+                      << " fill=" << std::setprecision(2) << c.fill_prob
+                      << " dur=" << c.duration_factor
+                      << " adv=" << c.adverse_bps
+                      << " score=" << std::setprecision(2) << c.score_bps << "bps"
+                      << std::defaultfloat << "\n";
+        }
+    }
 }
 
 bool BybitWSClient::has_mm(const std::string& symbol) const {

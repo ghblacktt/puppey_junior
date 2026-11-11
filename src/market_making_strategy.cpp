@@ -297,12 +297,8 @@ void MarketMakingStrategy::tick() {
     if (now < close_blocked_until_) return;
     if (last_trend_cut_ms_ > 0 && now - last_trend_cut_ms_ < 60'000) return;
 
-    if (pending_cancel_ask_.exchange(false, std::memory_order_relaxed)) {
-        cancel_ask_now("TOXIC_THROUGH");
-    }
-    if (pending_cancel_bid_.exchange(false, std::memory_order_relaxed)) {
-        cancel_bid_now("TOXIC_THROUGH");
-    }
+    if (pending_cancel_ask_.exchange(false, std::memory_order_relaxed)) cancel_ask_now("TOXIC_THROUGH");
+    if (pending_cancel_bid_.exchange(false, std::memory_order_relaxed)) cancel_bid_now("TOXIC_THROUGH");
 
     if (last_pos_refresh_ms_ == 0 || now - last_pos_refresh_ms_ > 20'000) {
         bool ok = refresh_position();
@@ -318,11 +314,9 @@ void MarketMakingStrategy::tick() {
     if (micro <= 0.0) micro = mid;
     if (best_bid <= 0 || best_ask <= 0) return;
 
-    {
-        uint64_t book_age = now - orderbook_.get_last_update_ms();
-        if (book_age > 10'000) return;
-    }
+    if (now - orderbook_.get_last_update_ms() > 10'000) return;
 
+    // ═══ inventory_usd ДО momentum ═══
     if (std::abs(inventory_qty_) > 1e-9) {
         inventory_usd_ = inventory_qty_ * mid;
     }
@@ -338,73 +332,131 @@ void MarketMakingStrategy::tick() {
         }
     }
 
-    // ═══ MOMENTUM MODE ═══
+    // ═══ MOMENTUM MODE (maker-only) ═══
     if (tp_engine_ && momentum_enabled_) {
         double hawkes = tp_engine_->target_skew_bps(now);
 
-        // ─── EXIT ───
+        // ─── EXIT (maker-only, без taker) ───
         if (momentum_active_) {
             uint64_t age = (now > momentum_entry_ms_) ? (now - momentum_entry_ms_) : 0;
-            double pnl_bps = last_unrealized_pnl_pct_ * 10000.0;
-            bool has_pos = std::abs(inventory_usd_) > 1.0;
+            bool has_pos = std::abs(inventory_qty_) > 1e-9;
 
-            // Take profit / forced timeout
-            if (has_pos && (pnl_bps > momentum_tp_bps_ || age > momentum_max_ms_)) {
-                close_position_market(best_bid, best_ask,
-                                      (pnl_bps > momentum_tp_bps_) ? "MOMENTUM_TP" : "MOMENTUM_TIMEOUT");
-                momentum_active_ = false;
-                momentum_retry_  = 0;
-                momentum_last_entry_attempt_ms_ = now;
-                return;
-            }
-
-            // Позиция не открылась — сбрасываем через 500ms
-            if (!has_pos && age > 500) {
+            // Позиция не открылась — сбрасываем через 3s
+            if (!has_pos && age > 3'000) {
                 if (!bid_order_id_.empty()) { api_.cancel_order(symbol_, bid_order_id_); bid_order_id_.clear(); last_bid_p_ = 0.0; }
                 if (!ask_order_id_.empty()) { api_.cancel_order(symbol_, ask_order_id_); ask_order_id_.clear(); last_ask_p_ = 0.0; }
+                if (!momentum_close_oid_.empty()) { api_.cancel_order(symbol_, momentum_close_oid_); momentum_close_oid_.clear(); }
                 momentum_active_ = false;
                 momentum_retry_  = 0;
                 momentum_last_entry_attempt_ms_ = now;
                 return;
             }
 
-            // Retry — ТОЛЬКО PASSIVE (без +tick, чтобы не стать taker)
-            if (age > 500 && momentum_retry_ < 2 && !has_pos) {
-                if (!bid_order_id_.empty()) { api_.cancel_order(symbol_, bid_order_id_); bid_order_id_.clear(); }
-                if (!ask_order_id_.empty()) { api_.cancel_order(symbol_, ask_order_id_); ask_order_id_.clear(); }
+            if (!has_pos) return;   // ждём entry fill
 
-                double qty = api_.normalize_qty(symbol_, momentum_qty_usd_ / mid);
-                if (qty > 0) {
-                    std::string oid;
-                    if (momentum_skew_ > 0) {
-                        // PASSIVE: best_bid, не +tick
-                        double px = api_.normalize_price(symbol_, best_bid);
-                        if (px < best_ask) {
-                            oid = api_.place_limit_order(symbol_, "Buy", px, qty, 0, 0, 0);
-                            if (!oid.empty()) { bid_order_id_ = oid; last_bid_p_ = px; }
-                        }
-                    } else {
-                        double px = api_.normalize_price(symbol_, best_ask);
-                        if (px > best_bid) {
-                            oid = api_.place_limit_order(symbol_, "Sell", px, qty, 0, 0, 0);
-                            if (!oid.empty()) { ask_order_id_ = oid; last_ask_p_ = px; }
-                        }
-                    }
+            // ── PnL в bps ──
+            double pnl_bps = 0.0;
+            if (momentum_entry_px_ > 0.0) {
+                pnl_bps = momentum_entry_sign_ * (mid - momentum_entry_px_) / momentum_entry_px_ * 10000.0;
+            }
+
+            // ── Прогрессивный maker offset по возрасту ──
+            int offset_ticks = 1;
+            if      (age >  5'000) offset_ticks = 2;
+            else if (age > 10'000) offset_ticks = 5;
+            else if (age > 20'000) offset_ticks = 15;   // near BBO, ещё maker
+
+            std::string close_side = (inventory_qty_ > 0) ? "Sell" : "Buy";
+            double close_qty = std::abs(inventory_qty_);
+            double close_px;
+
+            if (close_side == "Sell") {
+                close_px = best_ask - tick_size * offset_ticks;
+                if (close_px <= best_bid) close_px = best_bid + tick_size;   // всё ещё maker
+            } else {
+                close_px = best_bid + tick_size * offset_ticks;
+                if (close_px >= best_ask) close_px = best_ask - tick_size;
+            }
+            close_px = api_.normalize_price(symbol_, close_px);
+
+            // ═══ Поставить / переставить / отменить maker close ═══
+            bool need_replace = false;
+            if (momentum_close_oid_.empty()) {
+                need_replace = true;
+            } else {
+                auto ord = api_.get_order(symbol_, momentum_close_oid_);
+                if (ord.order_status == "Filled") {
+                    momentum_close_oid_.clear();
+                    momentum_active_ = false;
+                    momentum_retry_  = 0;
+                    momentum_last_entry_attempt_ms_ = now;
+                    std::cout << "[MOMENTUM-CLOSE] " << symbol_ << " FILLED "
+                              << close_side << " pnl_bps=" << std::fixed << std::setprecision(2) << pnl_bps
+                              << " age=" << age << " off=" << offset_ticks << "t"
+                              << std::defaultfloat << "\n";
+                    return;
                 }
-                momentum_retry_++;
+                if (ord.order_status == "Cancelled" || ord.order_status.empty()) {
+                    momentum_close_oid_.clear();
+                    need_replace = true;
+                } else if (std::abs(close_px - momentum_close_px_) > tick_size * 0.5) {
+                    api_.cancel_order(symbol_, momentum_close_oid_);
+                    momentum_close_oid_.clear();
+                    need_replace = true;
+                } else if (now - momentum_close_ts_ > 2'000) {
+                    api_.cancel_order(symbol_, momentum_close_oid_);
+                    momentum_close_oid_.clear();
+                    need_replace = true;
+                }
+            }
+
+            if (need_replace) {
+                momentum_close_oid_ = api_.place_limit_order(symbol_, close_side, close_px, close_qty, 0, 0, 0);
+                momentum_close_px_  = close_px;
+                momentum_close_ts_  = now;
+
+                std::cout << "[MOMENTUM-CLOSE-ATTEMPT] " << symbol_ << " " << close_side
+                          << " px=" << close_px << " bb=" << best_bid << " ba=" << best_ask
+                          << " off=" << offset_ticks << "t"
+                          << " pnl_bps=" << std::fixed << std::setprecision(2) << pnl_bps
+                          << " age=" << age
+                          << std::defaultfloat << "\n";
+            }
+
+            // ═══ Hard timeout — БЕЗ taker, отпускаем позицию ═══
+            if (age > momentum_max_ms_) {
+                if (!momentum_close_oid_.empty()) {
+                    api_.cancel_order(symbol_, momentum_close_oid_);
+                    momentum_close_oid_.clear();
+                }
+                momentum_active_ = false;
+                momentum_retry_  = 0;
+                momentum_last_entry_attempt_ms_ = now;
+                std::cout << "[MOMENTUM-HOLD] " << symbol_
+                          << " pos held (maker timeout) age=" << age
+                          << " pos=" << inventory_qty_
+                          << " pnl_bps=" << std::fixed << std::setprecision(2) << pnl_bps
+                          << std::defaultfloat << "\n";
+                // Позиция останется — следующий сигнал (или противоположный) закроет её
+                return;
             }
             return;
         }
 
-        // ─── ENTRY ───
+        // ─── ENTRY (maker-only) ───
         double vpin_now = cluster_.get_vpin(20);
         bool cooldown_ok = (momentum_last_entry_attempt_ms_ == 0)
                            || (now - momentum_last_entry_attempt_ms_ > momentum_cooldown_ms_);
         bool vpin_ok = (vpin_now < vpin_pause_);
-        bool no_pos = std::abs(inventory_usd_) < 1.0;
+        bool no_pos = std::abs(inventory_qty_) < 1e-9;
 
-        if (cooldown_ok && vpin_ok && no_pos
-            && std::abs(hawkes) > momentum_thr_
+        // Разрешаем entry при flat ИЛИ при противоположном сигнале (естественный close)
+        bool opposite_signal = (inventory_qty_ >  1e-9 && hawkes < -momentum_thr_)
+                               || (inventory_qty_ < -1e-9 && hawkes >  momentum_thr_);
+        bool can_enter = no_pos || opposite_signal;
+
+        if (momentum_selected_ && cooldown_ok && vpin_ok && no_pos
+            && std::abs(hawkes) > 1.0
             && regime_.bid.mode != mm::SymMode::Toxic
             && regime_.ask.mode != mm::SymMode::Toxic)
         {
@@ -413,35 +465,39 @@ void MarketMakingStrategy::tick() {
                 if (!bid_order_id_.empty()) { api_.cancel_order(symbol_, bid_order_id_); bid_order_id_.clear(); last_bid_p_ = 0.0; }
                 if (!ask_order_id_.empty()) { api_.cancel_order(symbol_, ask_order_id_); ask_order_id_.clear(); last_ask_p_ = 0.0; }
 
+                bool tight = (best_ask - best_bid) < 2.0 * tick_size;
                 std::string oid;
-                double px = 0.0;
-                // ═══ ФИКС 2: PASSIVE entry на best_bid/best_ask (не +tick) ═══
+                double px;
+                int8_t sign;
+
+                // ═══ TAKER ENTRY: cross spread, гарантированный fill ═══
                 if (hawkes > 0) {
-                    double px = api_.normalize_price(symbol_, best_bid);
-                    if (px >= best_ask) px = best_ask - tick_size;
-                    if (px < best_ask) {
-                        oid = api_.place_limit_order(symbol_, "Buy", px, qty, 0, 0, 0);
-                        if (!oid.empty()) { bid_order_id_ = oid; last_bid_p_ = px; }
-                    }
+                    px = api_.normalize_price(symbol_, best_ask + tick_size);
+                    oid = api_.place_limit_order(symbol_, "Buy", px, qty, 0, 0, 0);
+                    if (!oid.empty()) { bid_order_id_ = oid; last_bid_p_ = px; }
+                    sign = +1;
                 } else {
-                    double px = api_.normalize_price(symbol_, best_ask);
-                    if (px > best_bid) {
-                        oid = api_.place_limit_order(symbol_, "Sell", px, qty, 0, 0, 0);
-                        if (!oid.empty()) { ask_order_id_ = oid; last_ask_p_ = px; }
-                    }
+                    px = api_.normalize_price(symbol_, best_bid - tick_size);
+                    oid = api_.place_limit_order(symbol_, "Sell", px, qty, 0, 0, 0);
+                    if (!oid.empty()) { ask_order_id_ = oid; last_ask_p_ = px; }
+                    sign = -1;
                 }
 
                 if (!oid.empty()) {
-                    momentum_active_   = true;
-                    momentum_skew_     = hawkes;
-                    momentum_entry_ms_ = now;
-                    momentum_retry_    = 0;
+                    momentum_active_     = true;
+                    momentum_skew_       = hawkes;
+                    momentum_entry_ms_   = now;
+                    momentum_retry_      = 0;
+                    momentum_entry_px_   = px;
+                    momentum_entry_qty_  = qty;
+                    momentum_entry_sign_ = sign;
                     momentum_last_entry_attempt_ms_ = now;
                     std::cout << "[MOMENTUM] " << symbol_
                               << (hawkes > 0 ? " BUY " : " SELL ")
                               << "skew=" << std::fixed << std::setprecision(2) << hawkes
-                              << std::defaultfloat << " qty=$" << momentum_qty_usd_
-                              << " px=" << px << "\n";
+                              << " qty=$" << std::setprecision(0) << momentum_qty_usd_
+                              << " px=" << std::setprecision(4) << px
+                              << std::defaultfloat << "\n";
                 }
             }
             return;
@@ -449,7 +505,7 @@ void MarketMakingStrategy::tick() {
     }
     // ═══ /MOMENTUM MODE ═══
 
-    // ── Дальше обычная MM ──
+    // ═══ Дальше обычная MM (без изменений) ═══
     if (vpin_pause_until_ > 0 && now < vpin_pause_until_) {
         if (!bid_order_id_.empty()) { api_.cancel_order(symbol_, bid_order_id_); log_cancel(bid_order_id_, "TOXIC_PAUSE"); bid_order_id_.clear(); last_bid_p_ = 0.0; }
         if (!ask_order_id_.empty()) { api_.cancel_order(symbol_, ask_order_id_); log_cancel(ask_order_id_, "TOXIC_PAUSE"); ask_order_id_.clear(); last_ask_p_ = 0.0; }
@@ -482,7 +538,6 @@ void MarketMakingStrategy::tick() {
         return;
     }
 
-    // inventory_usd_ уже обновлён в начале, но обновим ещё раз для обычной MM
     if (std::abs(inventory_qty_) > 1e-9) inventory_usd_ = inventory_qty_ * mid;
 
     update_pending_markouts(now);
@@ -1333,6 +1388,67 @@ void MarketMakingStrategy::cancel_bid_now(const std::string& reason) {
     bid_order_id_.clear();
     last_bid_p_ = 0.0;
     bid_cooldown_until_ = this->now() + 5'000;
+}
+
+// ============================================================
+// Momentum signal — ранжирование по expected value
+// ============================================================
+MarketMakingStrategy::MomentumSignal MarketMakingStrategy::compute_momentum_signal(uint64_t now) const {
+    MomentumSignal sig{};
+    sig.symbol = symbol_;
+    sig.venue  = is_bitunix_symbol_ ? "bitunix" : "bybit";
+    sig.is_valid = false;
+
+    if (!tp_engine_ || !momentum_enabled_) return sig;
+
+    double hawkes = tp_engine_->target_skew_bps(now);
+    if (std::abs(hawkes) < 1.0) return sig;
+
+    double best_bid = orderbook_.get_best_bid();
+    double best_ask = orderbook_.get_best_ask();
+    if (best_bid <= 0 || best_ask <= 0) return sig;
+
+    auto info = api_.get_instrument_info(symbol_);
+    double tick = info.tick_size;
+    if (tick <= 0) return sig;
+
+    double spread_ticks = (best_ask - best_bid) / tick;
+
+    // fill_prob
+    double fill_prob;
+    if      (spread_ticks < 1.5) fill_prob = 0.20;
+    else if (spread_ticks < 2.5) fill_prob = 0.60;
+    else                         fill_prob = 0.85;
+
+    // duration_factor
+    double decay = tp_engine_->decay_for_venue(0);
+    double duration_factor = std::exp(-decay * 0.5);
+
+    // adverse — ОСЛАБЛЕНО: 3.0 → 1.0, чтобы не блокировать все
+    double adverse_bps = 0.0;
+    const auto& reg_side = (hawkes > 0) ? regime_.bid : regime_.ask;
+    if (reg_side.n_markouts_4h >= 20) {
+        double mk = reg_side.med_mk_30s;
+        if (mk < -5.0) adverse_bps = 1.0;   // было 3.0 при mk<-2
+        else if (mk < -2.0) adverse_bps = 0.5;
+    }
+
+    // fee — для теста 2.0 (maker entry), close пока taker=0
+    double fee_bps = 2.0;
+
+    sig.hawkes_bps      = hawkes;
+    sig.spread_ticks    = spread_ticks;
+    sig.fill_prob       = fill_prob;
+    sig.duration_factor = duration_factor;
+    sig.adverse_bps     = adverse_bps;
+    sig.side            = (hawkes > 0) ? +1 : -1;
+
+    sig.score_bps = std::abs(hawkes) * fill_prob * duration_factor
+                    - fee_bps
+                    - adverse_bps;
+
+    sig.is_valid = (std::abs(hawkes) >= 2.0);
+    return sig;
 }
 
 void MarketMakingStrategy::shutdown_gracefully(const std::string& reason) {

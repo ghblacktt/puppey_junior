@@ -57,7 +57,11 @@ namespace tp {
             st.value += contrib;
             st.last_ts_ms = static_cast<double>(ts_ms);
         }
-
+        // Для momentum score — текущий decay по venue
+        double decay_for_venue(int venue) const {
+            if (venue < 0 || venue >= kVenues) return 1.0;
+            return state_[venue][0].decay;
+        }
         double target_skew_bps(uint64_t now_ms) const {
             double total = 0.0;
             for (int v = 0; v < kVenues; ++v) {

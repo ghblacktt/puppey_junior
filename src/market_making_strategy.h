@@ -131,6 +131,26 @@ public:
         double kernel       = 0.0;
     };
 
+// ═══ Ranking: expected value для momentum ═══
+    struct MomentumSignal {
+        std::string symbol;
+        std::string venue;         // "bybit", "bitunix"
+        int         side;          // +1 buy, -1 sell
+        double      hawkes_bps;
+        double      spread_ticks;
+        double      fill_prob;
+        double      duration_factor;
+        double      adverse_bps;
+        double      score_bps;     // итоговый EV
+        bool        is_valid;
+    };
+    // ── Ranking momentum ──
+    MomentumSignal compute_momentum_signal(uint64_t now) const;
+    void set_momentum_selected(bool sel) { momentum_selected_ = sel; }
+    bool is_momentum_enabled() const { return momentum_enabled_; }
+    const std::string& get_symbol() const { return symbol_; }
+    const std::string& get_venue() const { return is_bitunix_symbol_ ? "bitunix" : "bybit"; }
+
     struct PlacedOrderInfo {
         double      price;
         std::string side;
@@ -227,9 +247,11 @@ public:
         momentum_qty_usd_ = qty_usd;
     }
     std::shared_ptr<tp::TruePriceEngine> tp_engine_;
+    void set_momentum_threshold(double thr_bps) { momentum_thr_ = thr_bps; }
 
 
 private:
+    bool     momentum_selected_ = false;
     HmaFilter    hma_fast_{8,  1000};   // 8 секунд, быстрый тренд
     HmaFilter    hma_slow_{32, 1000};   // 32 секунды, медленный тренд
     KernelFilter kernel_{120'000, 30'000};   // 2 мин окно, 30s bandwidth
@@ -370,9 +392,15 @@ private:
     uint64_t momentum_entry_ms_             = 0;
     int      momentum_retry_                = 0;
     uint64_t momentum_last_entry_attempt_ms_ = 0;   // ← cooldown
+    double   momentum_entry_px_       = 0.0;   // ← ДОБАВИТЬ
+    double   momentum_entry_qty_      = 0.0;   // ← ДОБАВИТЬ
+    int8_t   momentum_entry_sign_     = 0;
+    std::string momentum_close_oid_;              // текущий close order
+    double      momentum_close_px_  = 0.0;        // его цена
+    uint64_t    momentum_close_ts_  = 0;          // когда поставили
+    uint64_t    momentum_max_ms_    = 30'000;     // было 5000 — maker close нужен запас
     double   momentum_qty_usd_              = 100.0;
     double   momentum_thr_                  = 10.0;
-    double   momentum_tp_bps_               = 3.0;
-    uint64_t momentum_max_ms_               = 5'000;
-    uint64_t momentum_cooldown_ms_          = 60'000;   // 60s между entries
+    double   momentum_tp_bps_               = 2.0;
+    uint64_t momentum_cooldown_ms_          = 3'000;   // 60s между entries
 };
