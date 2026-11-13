@@ -22,9 +22,27 @@
 #include "features/kernel_filter.h"
 #include "symbol_regime.h"
 #include "true_price/true_price_engine.h"
+#include <optional>
 
 using arb::IExchange;
 class CrossVenueSignalEngine;
+
+namespace mm_cfg {
+
+    struct RegimeTuning { double half_spread_mult = 1.0; double qty_mult = 1.0; };
+
+    [[nodiscard]] constexpr auto regimeTuning(mm::SymMode m) noexcept -> RegimeTuning
+    {
+        switch (m) {
+            case mm::SymMode::Toxic:    return {.half_spread_mult=1.5, .qty_mult=0.3};
+            case mm::SymMode::Illiquid: return {.half_spread_mult=2.0, .qty_mult=0.5};
+            default:                    return {.half_spread_mult=1.0, .qty_mult=1.0};
+        }
+    }
+
+} // namespace mm_cfg
+
+
 class MarketMakingStrategy : public std::enable_shared_from_this<MarketMakingStrategy> {
 public:
     void set_regime_snapshot(const mm::SymModeSnapshot& s) { regime_ = s; }
@@ -251,6 +269,49 @@ public:
 
 
 private:
+
+    enum class QuoteSide { Bid, Ask };
+
+    struct QuotePrices { double bid; double ask; };
+
+    [[nodiscard]] QuotePrices computeQuotePrices(
+            double micro, double bid_half, double ask_half,
+            double skew, double momentum_skew, double obi_skew,
+            double ofi_skew, double cross_skew,
+            double best_bid, double best_ask, double tick_size) const;
+
+    void maintainQuoteSide(QuoteSide side,
+                           bool allow,
+                           bool needs_replace,
+                           double px,
+                           double qty,
+                           const PlaceContext& ctx,
+                           uint64_t now);
+    void cancelStaleIfNeeded(QuoteSide side, double mid, uint64_t now);
+
+    struct GateInputs {
+        double   q_ratio         = 0.0;
+        double   bid_price       = 0.0;
+        double   ask_price       = 0.0;
+        double   best_bid        = 0.0;
+        double   best_ask        = 0.0;
+        double   bid_block_ratio = 0.0;
+        double   ask_block_ratio = 0.0;
+        double   drift_bps       = 0.0;
+        double   drift_thr_bps   = 0.0;
+        uint64_t now             = 0;
+    };
+
+    struct SideGates {
+        bool        allow_bid        = true;
+        bool        allow_ask        = true;
+        const char* bid_block_reason = "";
+        const char* ask_block_reason = "";
+    };
+
+    [[nodiscard]] SideGates evaluateGates(const GateInputs& in);
+
+
     bool     momentum_selected_ = false;
     HmaFilter    hma_fast_{8,  1000};   // 8 секунд, быстрый тренд
     HmaFilter    hma_slow_{32, 1000};   // 32 секунды, медленный тренд
@@ -411,4 +472,145 @@ private:
     double entry_price_ = 0.0;
     double   obi_ema_ = 0.0;
     uint64_t obi_ema_last_ms_ = 0;
+
+    // ─── Tick pipeline ───────────────────────────────────────
+    void   logBlockingState(uint64_t now);
+
+    void   cancelAllOrders(const char* reason);     // nullptr = без log_cancel
+    void   cancelBidIfAny(const char* reason);
+    void   cancelAskIfAny(const char* reason);
+
+    void   processPendingClose(uint64_t now, double best_bid, double best_ask);
+
+    // Возвращает true, если tick «съеден» (нужно выйти из tick()).
+    bool   handleMomentumMode(uint64_t now, double mid,
+                              double best_bid, double best_ask,
+                              double tick_size);
+    bool   handleMaxHold(uint64_t now, double mid,
+                         double best_bid, double best_ask);
+    bool   handleTrendCut(uint64_t now, double mid,
+                          double best_bid, double best_ask);
+
+    // ─── Вычисления ──────────────────────────────────────────
+    double computeMomentumSkew(uint64_t now, double mid) const;
+    double computeTimeUrgency(uint64_t now) const;
+    double computeDrift60sBps(uint64_t now, double mid) const;
+
+    // Возвращает mid из истории, ближайший к now-window_ms;
+    // если не нашли — самый старый; если история пуста — fallback.
+    double findMidAgo(uint64_t now, uint64_t window_ms, double fallback) const;
+
+    void   updateSigmaEma(uint64_t now, double sigma);
+    void   pushMidHistory(uint64_t now, double mid);
+
+    // ─── Логи ────────────────────────────────────────────────
+    void   logDriftState(uint64_t now, double drift_bps,
+                         double thr_bps, double sigma);
+    void   logTickEnd(uint64_t now, double mid,
+                      double bid_px, double ask_px,
+                      bool allow_bid, bool allow_ask,
+                      double q_ratio, double half_spread,
+                      double sigma, double hma_skew_bps);
+
+    // ─── Struct-ы результатов ────────────────────────────────
+    struct VolState {
+        double   sigma              = 0.0;
+        double   vol_ratio          = 1.0;
+        double   stress_mult_spread = 1.0;
+        double   stress_mult_qty    = 1.0;
+        bool     cancel_all         = false;
+    };
+
+    struct SpreadState {
+        double half_spread = 0.0;
+        double sigma_ratio = 1.0;
+        double eff_qty_usd = 0.0;
+    };
+
+    struct Signals {
+        double q_ratio       = 0.0;
+        double obi           = 0.0;
+        double ofi_norm      = 0.0;
+        double momentum_skew = 0.0;
+    };
+
+    struct SideHalves {
+        double bid = 0.0;
+        double ask = 0.0;
+    };
+
+    struct CrossSkew {
+        double skew   = 0.0;   // в долях mid
+        double hawkes = 0.0;   // bps
+        double shadow = 0.0;   // bps
+    };
+
+    struct Qtys {
+        double bid       = 0.0;
+        double ask       = 0.0;
+        bool   allow_bid = true;
+        bool   allow_ask = true;
+    };
+
+    struct ReplaceFlags {
+        bool   bid       = false;
+        bool   ask       = false;
+        double bid_price = 0.0;   // может быть «снапнута» на last
+        double ask_price = 0.0;
+    };
+
+    using RegimeTuning = mm_cfg::RegimeTuning;
+    // ─── Методы ──────────────────────────────────────────────
+    bool handleToxicFillCheck(uint64_t now, double mid,
+                              double best_bid, double best_ask);
+    bool handleVpinPause(uint64_t now);
+
+    Signals computeSignals(uint64_t now, double mid);
+    VolState computeVolatility(uint64_t now);
+    SpreadState computeSpreadParams(double mid, double best_bid, double best_ask,
+                                    double sigma, const VolState& vol);
+    SideHalves computeSideHalves(double half_spread, double q_ratio,
+                                 double hma_skew_bps,
+                                 const RegimeTuning& bid_tuning,
+                                 const RegimeTuning& ask_tuning) const;
+    CrossSkew computeCrossSkew(uint64_t now, double mid);
+
+    Qtys computeQuantities(double mid, double q_ratio, double eff_qty_usd,
+                           const RegimeTuning& bid_tuning,
+                           const RegimeTuning& ask_tuning);
+    double clampQtyToMinNotional(double q, double mid, mm::SymMode mode) const;
+
+    ReplaceFlags computeReplaceFlags(uint64_t now,
+                                     double bid_price, double ask_price,
+                                     double bid_half, double ask_half,
+                                     double tick_size) const;
+
+    PlaceContext buildPlaceContext(double mid, double best_bid, double best_ask,
+                                   double half_spread, double skew, double sigma,
+                                   double q_ratio, double hma_skew_bps,
+                                   double tp_shadow_bps, uint64_t now) const;
+
+    struct MarketSnapshot {
+        double mid;
+        double best_bid;
+        double best_ask;
+        double micro;
+    };
+
+    bool                            handleEarlyExits(uint64_t now) const;
+    std::optional<MarketSnapshot>   readMarketSnapshot(uint64_t now) const;
+    bool                            refreshPositionIfDue(uint64_t now);
+    double                          getTickSize(double mid) const;
+    bool                            handleRegimeFilter();
+    bool                            handleKillSwitch(double best_bid, double best_ask);
+    bool                            handleHardCap(double best_bid, double best_ask) const;
+    bool                            handleRiskExits(uint64_t now, double q_ratio,
+                                                    double best_bid, double best_ask);
+    double                          computeInventorySkew(uint64_t now, double half_spread,
+                                                         double sigma_ratio, double q_ratio) const;
+    void                            updateObiEma(uint64_t now, double obi);
+
+    struct BlockRatios { double bid = 0.0; double ask = 0.0; };
+    [[nodiscard]] BlockRatios computeBlockRatios() const noexcept;
+
 };
