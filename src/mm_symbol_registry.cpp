@@ -189,3 +189,10 @@ void MmSymbolRegistry::save_stats(
         std::cerr << "[Registry] save_stats failed: " << e.what() << "\n";
     }
 }
+
+bool MmSymbolRegistry::is_whitelisted(const std::string& symbol) const {
+    std::lock_guard lk(mtx_);
+    auto it = cache_.find(symbol);
+    if (it == cache_.end()) return false;   // НЕТ в таблице = НЕ торгуем
+    return it->second.enabled;
+}

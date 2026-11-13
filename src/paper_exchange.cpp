@@ -72,6 +72,11 @@ namespace arb {
 
     void PaperExchange::on_trade(const std::string& sym, double px, double qty,
                                  bool is_buyer_maker) {
+        static std::atomic<int> s_htouch{0};
+        static std::atomic<int> s_ht_skip{0};   // сколько adverse трейдов прошло МИМО нас
+        static std::atomic<int> s_htouch_rej{0};
+        static std::atomic<uint64_t> s_last_log{0};
+
         std::vector<ExchangeExecution> execs;
         {
             std::lock_guard lk(mtx_);
@@ -91,13 +96,17 @@ namespace arb {
                     bool hit_touch   = std::abs(px - o.price) < 1e-12;
 
                     if (hit_through) {
-                        o.queue_ahead = 0.0;
-                        fill_qty = std::min(qty, o.qty - o.filled_qty);
+                        // Трейд прошёл МИМО нас — чужой fill, мы остаёмся в книге
+                        s_ht_skip.fetch_add(1);
+                        continue;
                     } else if (hit_touch) {
                         double consumed = std::min(o.queue_ahead, qty);
                         o.queue_ahead -= consumed;
                         double remaining_after = qty - consumed;
-                        if (remaining_after <= 1e-12) continue;
+                        if (remaining_after <= 1e-12) {
+                            s_htouch_rej.fetch_add(1);
+                            continue;
+                        }
                         fill_qty = std::min(remaining_after, o.qty - o.filled_qty);
                     } else {
                         continue;
@@ -105,11 +114,19 @@ namespace arb {
                 } else {
                     bool hit_through = is_buy ? (px < o.price) : (px > o.price);
                     bool hit_touch   = std::abs(px - o.price) < 1e-9;
-                    if (!hit_through && !hit_touch) continue;
-                    if (hit_touch) {
-                        std::string key = sym + "_" + std::to_string(o.price) + "_" + o.side;
-                        touch_cum_volume_[key] += px * qty;
-                        if (touch_cum_volume_[key] < cfg_.touch_fill_volume_usd) continue;
+
+                    if (hit_through) {
+                        // ═══ FIX: hit_through — НЕ наш fill, кто-то другой был лучшим ═══
+                        s_ht_skip.fetch_add(1);
+                        continue;
+                    }
+                    if (!hit_touch) continue;
+
+                    std::string key = sym + "_" + std::to_string(o.price) + "_" + o.side;
+                    touch_cum_volume_[key] += px * qty;
+                    if (touch_cum_volume_[key] < cfg_.touch_fill_volume_usd) {
+                        s_htouch_rej.fetch_add(1);
+                        continue;
                     }
                     fill_qty = std::min(qty, o.qty - o.filled_qty);
                 }
@@ -125,9 +142,26 @@ namespace arb {
                     break;
                 }
 
+                s_htouch.fetch_add(1);
                 apply_fill_locked(o, o.price, fill_qty, true, execs);
             }
         }
+
+        // ═══ Лог раз в 10 с ═══
+        uint64_t now = now_ms();
+        if (now - s_last_log.load() > 10'000) {
+            s_last_log.store(now);
+            int htch     = s_htouch.load();
+            int ht_skip  = s_ht_skip.load();
+            int htch_rej = s_htouch_rej.load();
+            std::cerr << "[FILL-TYPE] hit_touch_fills=" << htch
+                      << " hit_through_skipped=" << ht_skip
+                      << " hit_touch_rejected=" << htch_rej
+                      << " model_queue=" << (cfg_.model_queue ? "1" : "0")
+                      << " touch_usd=" << cfg_.touch_fill_volume_usd
+                      << "\n";
+        }
+
         dispatch_fills(execs);
     }
 
@@ -339,6 +373,10 @@ namespace arb {
             }
 
             orders_[o.order_id] = o;
+
+            std::string key = sym + "_" + std::to_string(px) + "_" + side;
+            touch_cum_volume_[key] = 0.0;
+
             oid = o.order_id;
 
             if (aggressive && fill_px > 0) {

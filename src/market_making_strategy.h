@@ -403,4 +403,12 @@ private:
     double   momentum_thr_                  = 10.0;
     double   momentum_tp_bps_               = 2.0;
     uint64_t momentum_cooldown_ms_          = 3'000;   // 60s между entries
+    // ═══ Toxic fill detection (dynamic exit) ═══
+    bool        toxic_check_pending_ = false;
+    std::string toxic_check_side_;
+    double      toxic_mid_at_fill_ = 0.0;
+    int         adverse_fill_count_ = 0;
+    double entry_price_ = 0.0;
+    double   obi_ema_ = 0.0;
+    uint64_t obi_ema_last_ms_ = 0;
 };

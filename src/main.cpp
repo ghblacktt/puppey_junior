@@ -206,10 +206,10 @@ int main() {
 
     PaperExchange::Config cfg;
     cfg.initial_balance_usd   = 10000.0;
-    cfg.maker_fee_bps         = 0.0;
-    cfg.taker_fee_bps         = 0.0;
+    cfg.maker_fee_bps         = 2.0;
+    cfg.taker_fee_bps         = 5.5;
     cfg.taker_slippage_bps    = 3.0;
-    cfg.touch_fill_volume_usd = 2000.0;
+    cfg.touch_fill_volume_usd = 100.0;
     cfg.max_position_usd      = 200.0;
 
     net::io_context exec_ioc;
@@ -265,40 +265,52 @@ int main() {
     auto liquid_syms = api->get_top_liquid_symbols(kTopNSymbols);
     auto all_tickers = api->get_all_tickers_linear();
 
+    // ═══ Strict whitelist mode ═══
     std::vector<std::string> exec_symbols;
-    exec_symbols.reserve(liquid_syms.size());
-
-    for (const auto& sym : liquid_syms) {
-        if (!registry->is_enabled(sym)) continue;
-        if (is_stable_base(sym)) continue;
-        auto tit = all_tickers.find(sym);
-        if (tit == all_tickers.end() || tit->second.last_price <= 0.0) continue;
-
-        auto inst = api->get_instrument_info(sym, "linear");
-        if (inst.step_size <= 0.0) continue;
-        double step_value = inst.step_size * tit->second.last_price;
-        if (step_value > 15.0 || inst.min_order_amt > 10.0) continue;
-
-        exec_symbols.push_back(sym);
-    }
+    exec_symbols.reserve(64);
 
     for (const auto& sym : registry->enabled_symbols()) {
-        if (std::find(exec_symbols.begin(), exec_symbols.end(), sym) != exec_symbols.end())
-            continue;
+        if (!registry->is_whitelisted(sym)) continue;   // safety
         if (is_stable_base(sym)) continue;
+
         auto tit = all_tickers.find(sym);
-        if (tit == all_tickers.end() || tit->second.last_price <= 0.0) continue;
+        if (tit == all_tickers.end() || tit->second.last_price <= 0.0) {
+            std::cerr << "[MAIN] whitelist " << sym
+                      << " — no ticker, skip\n";
+            continue;
+        }
+
         auto inst = api->get_instrument_info(sym, "linear");
-        if (inst.step_size <= 0.0) continue;
+        if (inst.step_size <= 0.0) {
+            std::cerr << "[MAIN] whitelist " << sym
+                      << " — no instrument info, skip\n";
+            continue;
+        }
         double step_value = inst.step_size * tit->second.last_price;
-        if (step_value > 15.0 || inst.min_order_amt > 10.0) continue;
+        if (step_value > 15.0 || inst.min_order_amt > 10.0) {
+            std::cerr << "[MAIN] whitelist " << sym
+                      << " — step_value too big, skip\n";
+            continue;
+        }
 
         exec_symbols.push_back(sym);
-        std::cout << "[MAIN] + " << sym << " (registry-enabled)\n";
     }
 
+    std::cout << "[MAIN] Whitelist mode: " << exec_symbols.size()
+              << " / " << registry->enabled_symbols().size()
+              << " enabled symbols\n";
+    for (const auto& s : exec_symbols) {
+        auto cfg = registry->get(s);
+        std::cout << "  ✓ " << s
+                  << " qty=$" << (cfg.qty_usd > 0 ? cfg.qty_usd : 0)
+                  << " max_pos=$" << (cfg.max_position_usd > 0 ? cfg.max_position_usd : 0)
+                  << " hold=" << cfg.max_hold_sec << "s"
+                  << " (" << cfg.note << ")\n";
+    }
+
+
     if (exec_symbols.empty()) {
-        std::cerr << "[MAIN] FATAL: no symbols\n";
+        std::cerr << "[MAIN] FATAL: no whitelisted symbols\n";
         return EXIT_FAILURE;
     }
 

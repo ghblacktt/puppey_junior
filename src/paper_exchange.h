@@ -27,7 +27,7 @@ namespace arb {
             // NEW: realistic execution models
             int    latency_ms_min        = 20;
             int    latency_ms_max        = 80;
-            bool   model_queue           = true;
+            bool   model_queue           = false;
             bool   model_market_slippage = true;
         };
 

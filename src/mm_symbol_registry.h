@@ -47,7 +47,7 @@ public:
     MmGlobalConfig global() const;
 
     void reload();
-
+    bool is_whitelisted(const std::string& symbol) const;
     // NEW: записать snapshot конфига перед запуском
     void snapshot_config(const std::string& comment);
 

@@ -132,7 +132,6 @@ void BybitWSClient::init_mm_strategies(IExchange& exchange) {
 
 void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     if (!exchange_) return;
-
     auto it = tickers_.find(symbol);
     if (it == tickers_.end()) return;
     if (mm_strategies_.count(symbol) > 0) return;
@@ -140,18 +139,32 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     double px_hint = it->second->orderbook.get_mid_price();
     if (px_hint <= 0.0) return;
 
-    static const std::set<std::string> kMomentumWhitelist = {
-            "XMRUSDT", "TAOUSDT", "ZECUSDT", "HYPEUSDT",
-            "ARBUSDT", "OPUSDT", "SUIUSDT", "APTUSDT",
-            "SEIUSDT", "TIAUSDT", "INJUSDT", "NEARUSDT",
-            "DOGEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
-            "ORDIUSDT", "ARKMUSDT", "WLDUSDT", "JUPUSDT",
-    };
-    bool is_momentum_sym = (kMomentumWhitelist.count(symbol) > 0);
+    // ═══ Illiquid filter ═══
+    {
+        double bb = it->second->orderbook.get_best_bid();
+        double ba = it->second->orderbook.get_best_ask();
+        if (bb <= 0 || ba <= bb) {
+            std::cout << "[MM] " << symbol << " skipped (bad book)\n";
+            return;
+        }
+        double mid_hint = (bb + ba) / 2.0;
+        double spread_bps = (ba - bb) / mid_hint * 10000.0;
+        double bid_depth_usd = bb * it->second->orderbook.get_best_bid_size();
+        double ask_depth_usd = ba * it->second->orderbook.get_best_ask_size();
+        double min_depth_usd = std::min(bid_depth_usd, ask_depth_usd);
 
-    if (paper_exchange_ != nullptr && !is_momentum_sym) {
-        std::cout << "[MM] " << symbol << " skipped (paper: non-momentum)\n";
-        return;
+        if (spread_bps > 80.0) {
+            std::cout << "[MM] " << symbol << " skipped (spread="
+                      << std::fixed << std::setprecision(1) << spread_bps
+                      << "bps > 80)\n" << std::defaultfloat;
+            return;
+        }
+        if (min_depth_usd < 2000.0) {
+            std::cout << "[MM] " << symbol << " skipped (depth=$"
+                      << std::fixed << std::setprecision(0) << min_depth_usd
+                      << " < $2000)\n" << std::defaultfloat;
+            return;
+        }
     }
 
     MmGlobalConfig g;
@@ -186,17 +199,18 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
             symbol, base_spread, qty_usd, max_position_usd);
     if (signal_engine_) mm->set_signal_engine(signal_engine_.get());
     if (is_bitunix_symbol(symbol)) mm->set_is_bitunix_symbol(true);
-// ── Per-symbol TruePriceEngine ──
+
+    // ── Per-symbol TruePriceEngine ──
     auto tp = std::make_shared<tp::TruePriceEngine>();
     tp::TruePriceEngine::Config tp_cfg;
     tp_cfg.max_skew_bps = 50.0;
-// decay=1.0 → half-life 693ms → impact живёт между tick(100ms)
     tp_cfg.amplitude[0][0] = 1.5;  tp_cfg.amplitude[0][1] = 1.5;
     tp_cfg.amplitude[1][0] = 1.5;  tp_cfg.amplitude[1][1] = 1.5;
     tp_cfg.decay[0][0] = 1.0;  tp_cfg.decay[0][1] = 1.0;
     tp_cfg.decay[1][0] = 1.0;  tp_cfg.decay[1][1] = 1.0;
     tp->set_config(tp_cfg);
     mm->set_tp_engine(tp);
+
     mm->set_executor(pos_manage_timer_.get_executor());
     mm->set_maker_fee_bps(g.maker_fee_bps);
     mm->set_use_adaptive(true);
@@ -223,20 +237,18 @@ void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
     mm->set_momentum_weight(sym_cfg.momentum_weight > 0 ? sym_cfg.momentum_weight : 1.0);
     if (sym_cfg.max_hold_sec > 0) mm->set_max_hold_sec(sym_cfg.max_hold_sec);
 
-    // ═══ MOMENTUM: включить + TP=3 bps, hold=5s ═══
-    mm->set_momentum_mode(is_momentum_sym, /*qty_usd=*/100.0);
-    if (is_momentum_sym) {
-        mm->set_momentum_tp(3.0, 5'000);
-        mm->set_momentum_threshold(3.0);
-    }
+    // ═══ MOMENTUM: DISABLED ═══
+    // Pure MM: maker-in, maker-out. Toxic fills ловятся через mk_100ms detector.
+    mm->set_momentum_mode(false, 0.0);
 
     std::cout << clr::green << "  ✓ " << clr::reset
               << pad_r(symbol, 14)
               << "$" << num(px_hint, 4)
               << "  half=" << num(min_hs * 10000, 1) << "bps"
-              << "  qty=$" << num(qty_usd, 0);
-    if (is_momentum_sym) {
-        std::cout << "  " << clr::cyan << "⚡ MOMENTUM tp=3bp hold=5s" << clr::reset;
+              << "  qty=$" << num(qty_usd, 0)
+              << "  max_pos=$" << num(max_position_usd, 0);
+    if (sym_cfg.max_hold_sec > 0) {
+        std::cout << "  hold=" << sym_cfg.max_hold_sec << "s";
     }
     std::cout << "\n";
 
@@ -277,6 +289,42 @@ void BybitWSClient::start_pos_manage() {
         return;
     }
 
+    {
+        static uint64_t _last_stats = 0;
+        uint64_t t = ch::now_ms();
+        if (t - _last_stats > 5'000) {
+            _last_stats = t;
+            int fresh = 0, stale = 0, empty = 0;
+            int b_lt5 = 0, b_5_10 = 0, b_10_20 = 0, b_20_35 = 0, b_35up = 0;
+
+            for (auto& [sym, tk] : tickers_) {
+                uint64_t lu = tk->orderbook.get_last_update_ms();
+                uint64_t age = (lu > 0 && t > lu) ? (t - lu) : UINT64_MAX;
+                double mid = tk->orderbook.get_mid_price();
+                double bb  = tk->orderbook.get_best_bid();
+                double ba  = tk->orderbook.get_best_ask();
+                if (mid <= 0 || bb <= 0 || ba <= bb) { empty++; continue; }
+                if (age > 10'000) { stale++; continue; }
+                fresh++;
+
+                double spread_bps = (ba - bb) / mid * 10000.0;
+                if      (spread_bps <  5) b_lt5++;
+                else if (spread_bps < 10) b_5_10++;
+                else if (spread_bps < 20) b_10_20++;
+                else if (spread_bps < 35) b_20_35++;
+                else                      b_35up++;
+            }
+            std::cout << "[BOOK-STATS] fresh=" << fresh << " stale=" << stale
+                      << " empty=" << empty
+                      << " | spread_bps: <5=" << b_lt5
+                      << " 5-10=" << b_5_10
+                      << " 10-20=" << b_10_20
+                      << " 20-35=" << b_20_35
+                      << " 35+=" << b_35up
+                      << " | total=" << tickers_.size() << "\n";
+        }
+    }
+
     pos_manage_timer_.expires_after(std::chrono::milliseconds(100));
     pos_manage_timer_.async_wait([this](beast::error_code ec) {
         if (ec) return;
@@ -288,7 +336,7 @@ void BybitWSClient::start_pos_manage() {
             // ── Momentum scanner (раз в 500ms) ──
             {
                 uint64_t now_scan = ch::now_ms();
-                if (now_scan - last_momentum_scan_ms_ > 500) {
+                if (now_scan - last_momentum_scan_ms_ > 1) {
                     last_momentum_scan_ms_ = now_scan;
                     scan_momentum_candidates();
                 }
@@ -388,28 +436,6 @@ void BybitWSClient::poll_mm_fills() {
 // Остальные методы — без изменений, кроме process_message
 // ============================================================
 
-bool BybitWSClient::can_open_new_position(double current_balance) {
-    if (kill_switch_active_) return false;
-    if (initial_balance_ > 0) {
-        double loss_pct = (initial_balance_ - current_balance) / initial_balance_;
-        if (loss_pct >= max_daily_loss_pct_) {
-            std::cerr << "[RISK] Daily loss limit reached! Loss: " << loss_pct * 100 << "%\n";
-            kill_switch_active_ = true;
-            return false;
-        }
-    }
-    static double peak_balance = initial_balance_;
-    if (current_balance > peak_balance) peak_balance = current_balance;
-    if (peak_balance > 0) {
-        double drawdown = (peak_balance - current_balance) / peak_balance;
-        if (drawdown >= max_drawdown_pct_) {
-            std::cerr << "[RISK] Max drawdown reached! Drawdown: " << drawdown * 100 << "%\n";
-            kill_switch_active_ = true;
-            return false;
-        }
-    }
-    return true;
-}
 
 void BybitWSClient::schedule_stats_output() {
     stats_timer_.expires_after(std::chrono::seconds(600));
@@ -510,9 +536,6 @@ void BybitWSClient::print_balance() {
     });
 }
 
-OrderBook& BybitWSClient::get_orderbook(const std::string& symbol) {
-    return tickers_.at(symbol)->orderbook;
-}
 
 void BybitWSClient::preload_history(const std::vector<std::string>& symbols, BybitApiClient& api) {
     std::cout << "[PRELOAD] Loading historical data for " << symbols.size() << " symbols...\n";
@@ -805,7 +828,8 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                     bool is_buyer_maker = false;
                     if (trade_elem["S"].get_string().get(side_str) == simdjson::SUCCESS)
                         is_buyer_maker = (side_str == "Sell");
-// trade_id из поля "i"
+
+                    // trade_id из поля "i"
                     std::string_view tid_sv;
                     uint64_t tid_hash;
                     if (trade_elem["i"].get_string().get(tid_sv) == simdjson::SUCCESS) {
@@ -815,7 +839,7 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                                              + "|" + std::to_string(price) + "|" + std::to_string(sz));
                     }
 
-// is_through
+                    // is_through
                     double bbo_bid = state.orderbook.get_best_bid();
                     double bbo_ask = state.orderbook.get_best_ask();
                     bool is_through = false;
@@ -824,20 +848,7 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                         if ( is_buyer_maker && price < bbo_bid) is_through = true;
                     }
 
-                    if (ch_writer_) {
-                        ch_writer_->push_trade(ch::VenueBybit, symbol,
-                                               ch::now_ms(), timestamp,
-                                               price, sz,
-                                               is_buyer_maker ? -1 : +1,
-                                               is_through ? 1 : 0,
-                                               tid_hash,
-                                               bbo_bid, bbo_ask);
-                    }
-                    state.vwma.add_tick(price, sz, timestamp);
-                    state.bb.add_tick(price, sz, timestamp);
-                    // ── Hawkes: Bybit trade -> tp_engine ──
-// Per-symbol: только этот MM получает трейды этого symbol
-                    // ── Per-symbol MM ──
+                    // ═══ 1. СНАЧАЛА MM — синхронно отменяет заявку, через которую прошёл трейд ═══
                     auto mm_it = mm_strategies_.find(symbol);
                     if (mm_it != mm_strategies_.end() && mm_it->second) {
                         auto* tp = mm_it->second->get_tp_engine();
@@ -858,8 +869,29 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                                           << std::defaultfloat << "\n";
                             }
                         }
+                        // Синхронный cancel при строгом through
                         if (!is_buyer_maker) mm_it->second->on_trade_through_ask(price, sz);
                         else                 mm_it->second->on_trade_through_bid(price, sz);
+                    }
+
+                    // ═══ 2. ПОТОМ paper exchange — заявка уже Cancelled, fill не будет ═══
+                    if (paper_exchange_) {
+                        paper_exchange_->on_trade(symbol, price, sz, is_buyer_maker);
+                    }
+
+                    // ═══ 3. Индикаторы ═══
+                    state.vwma.add_tick(price, sz, timestamp);
+                    state.bb.add_tick(price, sz, timestamp);
+
+                    // ═══ 4. CH-Writer (можно в любом месте) ═══
+                    if (ch_writer_) {
+                        ch_writer_->push_trade(ch::VenueBybit, symbol,
+                                               ch::now_ms(), timestamp,
+                                               price, sz,
+                                               is_buyer_maker ? -1 : +1,
+                                               is_through ? 1 : 0,
+                                               tid_hash,
+                                               bbo_bid, bbo_ask);
                     }
                 }
             }
@@ -1039,29 +1071,6 @@ void BybitWSClient::init_trade_ws(const std::string& host) {
     trade_ws_->run(host);
 }
 
-void BybitWSClient::init_private_ws(const std::string& host) {
-    private_ws_ = std::make_shared<BybitPrivateWSClient>(
-            ioc_, ctx_,
-            api_.get_api_key(), api_.get_api_secret(),
-            [this](const std::string& /*sym*/, const std::string& /*side*/,
-                   double /*sz*/, double /*avg*/, double /*pnl*/) {
-                // position update — при желании обновляйте локальный кэш
-            },
-            [this](const std::string& exec_id, const std::string& order_id,
-                   const std::string& symbol, const std::string& side,
-                   double price, double qty, double fee,
-                   const std::string& fee_ccy, uint64_t exec_time, bool is_maker) {
-                on_private_execution(exec_id, order_id, symbol, side,
-                                     price, qty, fee, fee_ccy, exec_time, is_maker);
-            },
-            [this](const std::string& oid, const std::string& link_id,
-                   const std::string& sym, const std::string& status,
-                   const std::string& reject) {
-                on_private_order(oid, link_id, sym, status, reject);
-            },
-            []() { std::cout << "[PrivWS] subscribed\n"; });
-    private_ws_->run(host);
-}
 
 void BybitWSClient::on_trade_ack(const BybitTradeWSClient::Ack& ack) {
     if (ack.ret_code != 0) {
@@ -1364,7 +1373,6 @@ void BybitWSClient::do_regime_update() {
         cand_bid.mode = mm::classify_side(cand_bid, depth_usdt, spread_frac, vpin);
         cand_ask.mode = mm::classify_side(cand_ask, depth_usdt, spread_frac, vpin);
 
-        // Гистерезис
         const auto& prev = mm_ptr->regime();
         cand_bid = mm::apply_hysteresis(prev.bid, cand_bid, now_ms);
         cand_ask = mm::apply_hysteresis(prev.ask, cand_ask, now_ms);
@@ -1403,52 +1411,70 @@ void BybitWSClient::do_regime_update() {
 // Momentum scanner — top-K ranking по expected value
 // ============================================================
 void BybitWSClient::scan_momentum_candidates() {
-    uint64_t now = ch::now_ms();
+    const uint64_t now = ch::now_ms();
 
-    std::vector<MarketMakingStrategy::MomentumSignal> candidates;
-    candidates.reserve(mm_strategies_.size());
+    // Один вызов compute_momentum_signal на символ за скан.
+    // Кэшируем результат, чтобы лог ниже не считал всё заново.
+    struct Entry {
+        std::string symbol;
+        MarketMakingStrategy::MomentumSignal sig;
+    };
+    std::vector<Entry> all;
+    all.reserve(mm_strategies_.size());
 
     for (auto& [sym, mm] : mm_strategies_) {
         if (!mm || !mm->is_momentum_enabled()) continue;
         auto sig = mm->compute_momentum_signal(now);
-        if (sig.is_valid && sig.score_bps > 0.0) {
-            candidates.push_back(sig);
-        }
+        sig.symbol = sym;  // гарантируем, что поле заполнено
+        all.push_back(Entry{sym, std::move(sig)});
     }
 
-    // Сортируем по score_bps desc
-    std::sort(candidates.begin(), candidates.end(),
-              [](const auto& a, const auto& b) { return a.score_bps > b.score_bps; });
+    // Кандидаты — только валидные, ссылками на элементы all.
+    std::vector<const Entry*> candidates;
+    candidates.reserve(all.size());
+    for (const auto& e : all) {
+        if (e.sig.is_valid) candidates.push_back(&e);
+    }
 
-    // Top-K
+    // Сортировка по score_bps desc.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Entry* a, const Entry* b) {
+                  return a->sig.score_bps > b->sig.score_bps;
+              });
+
+    // Top-K.
     constexpr size_t K_MAX = 10;
     std::set<std::string> selected;
-    for (size_t i = 0; i < std::min(K_MAX, candidates.size()); ++i) {
-        selected.insert(candidates[i].symbol);
+    const size_t k = std::min(K_MAX, candidates.size());
+    for (size_t i = 0; i < k; ++i) {
+        selected.insert(candidates[i]->symbol);
     }
 
-    // Установить флаг на каждом MM
+    // Установить флаг на каждом MM.
     for (auto& [sym, mm] : mm_strategies_) {
         if (!mm || !mm->is_momentum_enabled()) continue;
         mm->set_momentum_selected(selected.count(sym) > 0);
     }
 
-    // Лог (не чаще раз в 5s)
+    // Лог — не чаще раза в 5 с, из кэша, без повторного расчёта.
     static uint64_t _last_log = 0;
     if (now - _last_log > 5'000) {
         _last_log = now;
         std::cout << "[SCAN] candidates=" << candidates.size()
-                  << " selected=" << selected.size() << "\n";
-        for (size_t i = 0; i < std::min<size_t>(5, candidates.size()); ++i) {
-            const auto& c = candidates[i];
-            std::cout << "  #" << (i + 1) << " " << c.symbol
-                      << " " << (c.side > 0 ? "BUY " : "SELL")
-                      << " hawkes=" << std::fixed << std::setprecision(1) << c.hawkes_bps
-                      << " spread=" << std::setprecision(1) << c.spread_ticks << "t"
-                      << " fill=" << std::setprecision(2) << c.fill_prob
-                      << " dur=" << c.duration_factor
-                      << " adv=" << c.adverse_bps
-                      << " score=" << std::setprecision(2) << c.score_bps << "bps"
+                  << " selected=" << selected.size()
+                  << " total_mm=" << mm_strategies_.size() << "\n";
+        for (const auto& e : all) {
+            const auto& s = e.sig;
+            if (std::abs(s.hawkes_bps) < 1.0) continue;
+            const bool is_sel = selected.count(e.symbol) > 0;
+            std::cout << "  [DBG] " << e.symbol
+                      << " hawkes=" << std::fixed << std::setprecision(1) << s.hawkes_bps
+                      << " spread=" << std::setprecision(1) << s.spread_ticks << "t"
+                      << " fill="   << std::setprecision(2) << s.fill_prob
+                      << " dur="    << s.duration_factor
+                      << " score="  << s.score_bps << "bps"
+                      << " valid="  << (s.is_valid ? "1" : "0")
+                      << (is_sel ? " *SEL*" : "")
                       << std::defaultfloat << "\n";
         }
     }
