@@ -11,6 +11,7 @@
 #include <atomic>
 #include <thread>
 #include "screener.h"
+#include "local_orderbook.h"
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -27,6 +28,25 @@ public:
 
     void run(const std::string& host = "stream.bybit.com");
     void stop();
+
+    // ── Debug accessor (tests only) ──
+    // Возвращает снимок локальной книги. Для smoke-тестов
+    // без реального WS подключения.
+    struct DebugBook {
+        double best_bid = 0.0;
+        double best_ask = 0.0;
+        double bid_size = 0.0;
+        double ask_size = 0.0;
+        size_t bid_levels = 0;
+        size_t ask_levels  = 0;
+    };
+    DebugBook debug_book(const std::string& sym) const;
+
+    // Публичный парсер — используется только тестами для инъекции
+    // snapshot/delta без реального WS.
+    void debug_process_message(const char* data, std::size_t size) {
+        process_message(data, size);
+    }
 
 private:
     struct OrderbookUpdate {
@@ -96,4 +116,5 @@ private:
     std::mutex                  trade_queue_mutex_;
     std::thread                 trade_writer_thread_;
     std::atomic<bool>           trade_writer_running_{false};
+    std::unordered_map<std::string, scanner::LocalBook> local_books_;
 };

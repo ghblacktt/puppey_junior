@@ -1327,6 +1327,39 @@ std::vector<std::string> BybitApiClient::get_all_spot_symbols() {
 }
 
 std::vector<std::string> BybitApiClient::get_top_liquid_symbols(int top_n) {
+    // ═══ Шаг 1: instruments-info → set USDT LinearPerpetual Trading ═══
+    std::set<std::string> usdt_perps;
+    {
+        std::map<std::string, std::string> ip = {{"category","linear"},{"limit","1000"}};
+        std::string resp = send_request("GET", "/v5/market/instruments-info", ip, false);
+        if (!resp.empty()) {
+            simdjson::dom::parser p;
+            auto r = p.parse(resp);
+            if (!r.error()) {
+                simdjson::dom::array arr;
+                if (r.value()["result"]["list"].get_array().get(arr) == simdjson::SUCCESS) {
+                    for (auto item : arr) {
+                        std::string_view sym, ct, qa, st;
+                        if (item["symbol"].get_string().get(sym) != simdjson::SUCCESS) continue;
+                        if (item["contractType"].get_string().get(ct) != simdjson::SUCCESS) continue;
+                        if (item["quoteCoin"].get_string().get(qa) != simdjson::SUCCESS) continue;
+                        if (item["status"].get_string().get(st) != simdjson::SUCCESS) continue;
+                        if (ct == "LinearPerpetual" && qa == "USDT" && st == "Trading") {
+                            usdt_perps.insert(std::string(sym));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const bool filter_on = !usdt_perps.empty();
+    if (filter_on) {
+        std::cout << "[API] USDT LinearPerpetual Trading: " << usdt_perps.size() << "\n";
+    } else {
+        std::cerr << "[API] WARN: instruments-info empty — no quoteCoin filter\n";
+    }
+
+    // ═══ Шаг 2: tickers ═══
     std::vector<std::pair<std::string, double>> syms_with_turnover;
     std::map<std::string, std::string> params = {{"category", "linear"}, {"limit", "1000"}};
     std::string response = send_request("GET", "/v5/market/tickers", params, false);
@@ -1343,14 +1376,17 @@ std::vector<std::string> BybitApiClient::get_top_liquid_symbols(int top_n) {
     auto list_result = doc["result"]["list"].get_array();
     if (list_result.error()) return {};
 
+    int n_filtered = 0;
     for (auto item : list_result.value()) {
         std::string_view sym, turn_str;
-        if (item["symbol"].get_string().get(sym) == simdjson::SUCCESS &&
-            item["turnover24h"].get_string().get(turn_str) == simdjson::SUCCESS) {
-            double turn = safe_stod(turn_str);
-            if (turn > 1000000.0) syms_with_turnover.emplace_back(std::string(sym), turn);
-        }
+        if (item["symbol"].get_string().get(sym) != simdjson::SUCCESS) continue;
+        if (item["turnover24h"].get_string().get(turn_str) != simdjson::SUCCESS) continue;
+        if (filter_on && !usdt_perps.count(std::string(sym))) { n_filtered++; continue; }
+        double turn = safe_stod(turn_str);
+        if (turn > 1000000.0) syms_with_turnover.emplace_back(std::string(sym), turn);
     }
+    std::cout << "[API] tickers: kept=" << syms_with_turnover.size()
+              << " filtered_non_usdt=" << n_filtered << "\n";
 
     std::sort(syms_with_turnover.begin(), syms_with_turnover.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });

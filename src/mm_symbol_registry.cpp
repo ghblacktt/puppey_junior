@@ -90,14 +90,26 @@ MmGlobalConfig MmSymbolRegistry::global() const {
 }
 
 void MmSymbolRegistry::snapshot_config(const std::string& comment) {
+    // ═══════════════════════════════════════════════════════════
+    // Copy state под lock, отпустить до I/O. Иначе reload() может
+    // изменить cache_/global_ во время чтения → torn snapshot / UB.
+    // ═══════════════════════════════════════════════════════════
+    std::unordered_map<std::string, MmSymbolConfig> cache_snapshot;
+    MmGlobalConfig global_snapshot;
+    {
+        std::lock_guard lk(mtx_);
+        cache_snapshot = cache_;
+        global_snapshot = global_;
+    }
+
     try {
         pqxx::connection conn(conn_str_);
         pqxx::work txn(conn);
 
-        // Собираем JSON-представление текущего кэша
+        // ── build symbols JSON ──
         std::string symbols_json = "[";
         bool first = true;
-        for (const auto& [s, c] : cache_) {
+        for (const auto& [s, c] : cache_snapshot) {   // ← snapshot, не cache_
             if (!first) symbols_json += ",";
             first = false;
             symbols_json += "{\"symbol\":\"" + s + "\","
@@ -109,21 +121,22 @@ void MmSymbolRegistry::snapshot_config(const std::string& comment) {
         }
         symbols_json += "]";
 
+        // ── build global JSON — замени ВСЕ global_.xxx на global_snapshot.xxx ──
         std::string global_json = "{"
-                                  + std::string("\"maker_fee_bps\":") + std::to_string(global_.maker_fee_bps) + ","
-                                  + "\"max_half_spread_bps\":" + std::to_string(global_.max_half_spread_bps) + ","
-                                  + "\"kill_adverse_bps\":" + std::to_string(global_.kill_adverse_bps) + ","
-                                  + "\"half_spread_upper_pct\":" + std::to_string(global_.half_spread_upper_pct) + ","
-                                  + "\"hard_cap_ratio\":" + std::to_string(global_.hard_cap_ratio) + ","
-                                  + "\"block_ratio\":" + std::to_string(global_.block_ratio) + ","
-                                  + "\"gamma\":" + std::to_string(global_.gamma) + ","
-                                  + "\"vpin_pause_threshold\":" + std::to_string(global_.vpin_pause_threshold) + ","
-                                  + "\"vpin_resume_threshold\":" + std::to_string(global_.vpin_resume_threshold) + ","
-                                  + "\"soft_exit_pnl_pct\":" + std::to_string(global_.soft_exit_pnl_pct) + ","
-                                  + "\"soft_exit_ratio\":" + std::to_string(global_.soft_exit_ratio) + ","
-                                  + "\"min_qty_floor_usd\":" + std::to_string(global_.min_qty_floor_usd) + ","
-                                  + "\"max_qty_multiplier\":" + std::to_string(global_.max_qty_multiplier) + ","
-                                  + "\"max_position_default_usd\":" + std::to_string(global_.max_position_default_usd)
+                                  + std::string("\"maker_fee_bps\":") + std::to_string(global_snapshot.maker_fee_bps) + ","
+                                  + "\"max_half_spread_bps\":" + std::to_string(global_snapshot.max_half_spread_bps) + ","
+                                  + "\"kill_adverse_bps\":" + std::to_string(global_snapshot.kill_adverse_bps) + ","
+                                  + "\"half_spread_upper_pct\":" + std::to_string(global_snapshot.half_spread_upper_pct) + ","
+                                  + "\"hard_cap_ratio\":" + std::to_string(global_snapshot.hard_cap_ratio) + ","
+                                  + "\"block_ratio\":" + std::to_string(global_snapshot.block_ratio) + ","
+                                  + "\"gamma\":" + std::to_string(global_snapshot.gamma) + ","
+                                  + "\"vpin_pause_threshold\":" + std::to_string(global_snapshot.vpin_pause_threshold) + ","
+                                  + "\"vpin_resume_threshold\":" + std::to_string(global_snapshot.vpin_resume_threshold) + ","
+                                  + "\"soft_exit_pnl_pct\":" + std::to_string(global_snapshot.soft_exit_pnl_pct) + ","
+                                  + "\"soft_exit_ratio\":" + std::to_string(global_snapshot.soft_exit_ratio) + ","
+                                  + "\"min_qty_floor_usd\":" + std::to_string(global_snapshot.min_qty_floor_usd) + ","
+                                  + "\"max_qty_multiplier\":" + std::to_string(global_snapshot.max_qty_multiplier) + ","
+                                  + "\"max_position_default_usd\":" + std::to_string(global_snapshot.max_position_default_usd)
                                   + "}";
 
         txn.exec(
@@ -149,10 +162,7 @@ MmSymbolConfig MmSymbolRegistry::get(const std::string& symbol) const {
 }
 
 bool MmSymbolRegistry::is_enabled(const std::string& symbol) const {
-    std::lock_guard lk(mtx_);
-    auto it = cache_.find(symbol);
-    if (it == cache_.end()) return true;   // неизвестный — разрешён
-    return it->second.enabled;
+    return is_whitelisted(symbol);
 }
 
 std::vector<std::string> MmSymbolRegistry::enabled_symbols() const {
@@ -195,4 +205,33 @@ bool MmSymbolRegistry::is_whitelisted(const std::string& symbol) const {
     auto it = cache_.find(symbol);
     if (it == cache_.end()) return false;   // НЕТ в таблице = НЕ торгуем
     return it->second.enabled;
+}
+
+// ═══ Helper: default min_hs по price tier (как в create_mm_for_symbol) ═══
+double MmSymbolRegistry::default_min_hs_bps_for_price(double px) {
+    if (px <= 0.0)     return 5.0;    // safety
+    if (px > 100.0)    return 5.0;    // BTC, ETH: 5 bps
+    if (px > 1.0)      return 10.0;   // mid-cap: 10 bps
+    return 20.0;                      // small: 20 bps
+}
+
+// ═══ Per-symbol min_hs_bps с fallback ═══
+double MmSymbolRegistry::effective_min_hs_bps(
+        const std::string& symbol, double px) const {
+    std::lock_guard lk(mtx_);
+    auto it = cache_.find(symbol);
+    if (it != cache_.end() && it->second.min_hs_bps > 0.0) {
+        return it->second.min_hs_bps;
+    }
+    return default_min_hs_bps_for_price(px);
+}
+
+// ═══ Per-symbol max_hold_sec с fallback ═══
+int MmSymbolRegistry::effective_max_hold_sec(const std::string& symbol) const {
+    std::lock_guard lk(mtx_);
+    auto it = cache_.find(symbol);
+    if (it != cache_.end() && it->second.max_hold_sec > 0) {
+        return it->second.max_hold_sec;
+    }
+    return 120;   // default 120s (как в mm_symbols для winners)
 }

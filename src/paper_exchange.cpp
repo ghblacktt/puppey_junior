@@ -72,99 +72,41 @@ namespace arb {
 
     void PaperExchange::on_trade(const std::string& sym, double px, double qty,
                                  bool is_buyer_maker) {
-        static std::atomic<int> s_htouch{0};
-        static std::atomic<int> s_ht_skip{0};   // сколько adverse трейдов прошло МИМО нас
-        static std::atomic<int> s_htouch_rej{0};
-        static std::atomic<uint64_t> s_last_log{0};
+        // 1) FillModel детектит fills (hit_through/hit_touch/queue)
+        fill_model_.on_trade(sym, px, qty, is_buyer_maker, now_ms());
 
+        // 2) Применяем fills к Paper state (positions, balance, fees, ...)
         std::vector<ExchangeExecution> execs;
         {
             std::lock_guard lk(mtx_);
-
-            for (auto& [oid, o] : orders_) {
-                if (o.symbol != sym) continue;
-                if (o.status != "New" && o.status != "PartiallyFilled") continue;
-
-                bool is_buy = (o.side == "Buy");
-                if (is_buyer_maker != is_buy) continue;
-
-                double fill_qty = 0.0;
-
-                if (cfg_.model_queue) {
-                    bool hit_through = is_buy ? (px < o.price - 1e-12)
-                                              : (px > o.price + 1e-12);
-                    bool hit_touch   = std::abs(px - o.price) < 1e-12;
-
-                    if (hit_through) {
-                        // Трейд прошёл МИМО нас — чужой fill, мы остаёмся в книге
-                        s_ht_skip.fetch_add(1);
-                        continue;
-                    } else if (hit_touch) {
-                        double consumed = std::min(o.queue_ahead, qty);
-                        o.queue_ahead -= consumed;
-                        double remaining_after = qty - consumed;
-                        if (remaining_after <= 1e-12) {
-                            s_htouch_rej.fetch_add(1);
-                            continue;
-                        }
-                        fill_qty = std::min(remaining_after, o.qty - o.filled_qty);
-                    } else {
-                        continue;
-                    }
-                } else {
-                    bool hit_through = is_buy ? (px < o.price) : (px > o.price);
-                    bool hit_touch   = std::abs(px - o.price) < 1e-9;
-
-                    if (hit_through) {
-                        // ═══ FIX: hit_through — НЕ наш fill, кто-то другой был лучшим ═══
-                        s_ht_skip.fetch_add(1);
-                        continue;
-                    }
-                    if (!hit_touch) continue;
-
-                    std::string key = sym + "_" + std::to_string(o.price) + "_" + o.side;
-                    touch_cum_volume_[key] += px * qty;
-                    if (touch_cum_volume_[key] < cfg_.touch_fill_volume_usd) {
-                        s_htouch_rej.fetch_add(1);
-                        continue;
-                    }
-                    fill_qty = std::min(qty, o.qty - o.filled_qty);
-                }
-
-                if (fill_qty <= 1e-12) continue;
-
-                auto& pos = positions_[sym];
-                double cur_notional = std::abs(pos.signed_qty * o.price);
-                if (cur_notional + o.qty * o.price > cfg_.max_position_usd) {
-                    for (auto& [oid2, o2] : orders_) {
-                        if (o2.symbol == sym && o2.status == "New") o2.status = "Cancelled";
-                    }
-                    break;
-                }
-
-                s_htouch.fetch_add(1);
-                apply_fill_locked(o, o.price, fill_qty, true, execs);
+            auto fills = fill_model_.drain_fills();
+            for (const auto& f : fills) {
+                auto it = orders_.find(f.order_id);
+                if (it == orders_.end()) continue;
+                if (it->second.status != "New"
+                    && it->second.status != "PartiallyFilled") continue;
+                apply_fill_locked(it->second, f.exec_price, f.exec_qty,
+                        /*is_maker=*/true, execs);
             }
         }
 
-        // ═══ Лог раз в 10 с ═══
+        // 3) Раз в 10 сек — лог статистики
+        static std::atomic<uint64_t> s_last_log{0};
         uint64_t now = now_ms();
         if (now - s_last_log.load() > 10'000) {
             s_last_log.store(now);
-            int htch     = s_htouch.load();
-            int ht_skip  = s_ht_skip.load();
-            int htch_rej = s_htouch_rej.load();
-            std::cerr << "[FILL-TYPE] hit_touch_fills=" << htch
-                      << " hit_through_skipped=" << ht_skip
-                      << " hit_touch_rejected=" << htch_rej
-                      << " model_queue=" << (cfg_.model_queue ? "1" : "0")
-                      << " touch_usd=" << cfg_.touch_fill_volume_usd
+            auto st = fill_model_.stats();
+            std::cerr << "[FILL-TYPE] "
+                      << "hit_touch_fills="   << st.hit_touch_fills
+                      << " hit_through_fills=" << st.hit_through_fills
+                      << " hit_touch_rejected=" << st.hit_touch_rejects
+                      << " model_queue="       << (fill_model_.config().model_queue ? "1" : "0")
+                      << " touch_usd="         << fill_model_.config().touch_fill_volume_usd
                       << "\n";
         }
 
         dispatch_fills(execs);
     }
-
     // ============================================================
     // Market price estimation
     // ============================================================
@@ -346,19 +288,6 @@ namespace arb {
             o.status = "New";
 
             bool is_buy = (side == "Buy");
-            if (is_buy) {
-                if (std::abs(px - bbo.bid) < 1e-12) {
-                    o.queue_ahead = bbo.bid_size * 0.02;
-                }
-                else if (px > bbo.bid) o.queue_ahead = 0.0;
-                else                   o.queue_ahead = std::max(1.0 * bbo.bid_size, 1.0);
-            } else {
-                if (std::abs(px - bbo.ask) < 1e-12) {
-                    o.queue_ahead = bbo.ask_size * 0.02;
-                }
-                else if (px < bbo.ask) o.queue_ahead = 0.0;
-                else                   o.queue_ahead = std::max(1.0 * bbo.ask_size, 1.0);
-            }
 
             bool aggressive = false;
             double fill_px = 0.0;
@@ -374,8 +303,16 @@ namespace arb {
 
             orders_[o.order_id] = o;
 
-            std::string key = sym + "_" + std::to_string(px) + "_" + side;
-            touch_cum_volume_[key] = 0.0;
+            mm::FillModel::Order fmo;
+            fmo.order_id = o.order_id;
+            fmo.symbol   = sym;
+            fmo.side     = side;
+            fmo.price    = px;
+            fmo.qty      = qty;
+            fmo.placed_ms = o.placed_ms;
+            fill_model_.register_order(std::move(fmo),
+                                       bbo.bid, bbo.ask,
+                                       bbo.bid_size, bbo.ask_size);
 
             oid = o.order_id;
 
@@ -444,6 +381,7 @@ namespace arb {
             last_ret_code_ = -3; return false;
         }
         it->second.status = "Cancelled";
+        fill_model_.cancel(oid);
         last_ret_code_ = 0;
         return true;
     }
@@ -460,8 +398,8 @@ namespace arb {
         return r;
     }
 
-    ExchangePositionInfo PaperExchange::get_position_info(const std::string& sym, int /*idx*/) {
-        std::lock_guard lk(mtx_);
+    auto PaperExchange::get_position_info(const std::string& sym, int /*idx*/) -> ExchangePositionInfo {
+        std::lock_guard lk_guard(mtx_);
         ExchangePositionInfo r;
         r.symbol = sym;
         auto it = positions_.find(sym);
@@ -471,11 +409,29 @@ namespace arb {
             r.size = 0.0;
             return r;
         }
+
+        auto bbo_it = bbo_.find(sym);
+        if (bbo_it != bbo_.end() && bbo_it->second.bid > 0) {
+            double mid_now = (bbo_it->second.bid + bbo_it->second.ask) / 2.0;
+            double notional = std::abs(it->second.signed_qty) * mid_now;
+            if (notional > 0.0 && notional < 5.5) {
+                std::cerr << "[PAPER-DUST] " << sym
+                          << " wrote off qty=" << it->second.signed_qty
+                          << " $" << std::fixed << std::setprecision(4) << notional
+                          << "\n" << std::defaultfloat;
+                it->second.signed_qty = 0.0;
+                it->second.avg_price = 0.0;
+                r.is_valid = true;
+                r.signed_qty = 0.0;
+                r.size = 0.0;
+                return r;
+            }
+        }
+
         r.signed_qty = it->second.signed_qty;
         r.side = (it->second.signed_qty > 0) ? "Buy" : "Sell";
         r.size = std::abs(it->second.signed_qty);
         r.avg_price = it->second.avg_price;
-        auto bbo_it = bbo_.find(sym);
         if (bbo_it != bbo_.end()) {
             double mid = (bbo_it->second.bid + bbo_it->second.ask) / 2.0;
             r.unrealized_pnl = (it->second.signed_qty > 0)

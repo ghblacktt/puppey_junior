@@ -142,7 +142,35 @@ static void run_ioc_until_stopped(IoCtx& ioc, const char* tag) {
     std::cout << "[" << tag << "-IOC] stopped\n";
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--test-sprint1") {
+        extern int run_sprint1_tests();
+        return run_sprint1_tests();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--test-sprint2") {
+        extern int run_sprint2_tests();
+        return run_sprint2_tests();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--test-sprint3a") {
+        extern int run_sprint3a_tests();
+        return run_sprint3a_tests();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--test-sprint3b") {
+        extern int run_sprint3b_tests();
+        return run_sprint3b_tests();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--test-sprint4") {
+        extern int run_sprint4_tests();
+        return run_sprint4_tests();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--test-sprint5") {
+        extern int run_sprint5_tests();
+        return run_sprint5_tests();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--test-sprint6") {
+        extern int run_sprint6_tests();
+        return run_sprint6_tests();
+    }
     load_dotenv();
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
@@ -209,7 +237,7 @@ int main() {
     cfg.maker_fee_bps         = 2.0;
     cfg.taker_fee_bps         = 5.5;
     cfg.taker_slippage_bps    = 3.0;
-    cfg.touch_fill_volume_usd = 100.0;
+    cfg.touch_fill_volume_usd = 50.0;
     cfg.max_position_usd      = 200.0;
 
     net::io_context exec_ioc;
@@ -426,8 +454,69 @@ int main() {
         std::cout << "[MAIN] WARNING: no overlap between Bybit and Bitunix symbols\n";
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // 6) Scanner
+    // ═══════════════════════════════════════════════════════════
+    net::io_context screener_ioc;
+    auto screener = std::make_shared<Screener>(screener_ioc, ConnStr);
+    screener->set_run_tag(run_tag);
+    screener->set_registry(registry);
+    screener->load(*api);
+
+// В main.cpp, где формируется scan_symbols
+    std::vector<std::string> scan_symbols;
+    {
+        auto top = api->get_top_liquid_symbols(screener->config().scan_top_n);
+        int n_stable = 0, n_not_perp = 0, n_dated = 0, n_stock = 0;
+        for (const auto& s : top) {
+            if (is_stable_base(s)) { n_stable++; continue; }
+
+            // ═══ NEW: skip dated futures (содержат '-') ═══
+            if (s.find('-') != std::string::npos) { n_dated++; continue; }
+
+            // ═══ NEW: REST-проверка что это LinearPerpetual USDT Trading ═══
+            auto inst = api->get_instrument_info(s, "linear");
+            if (inst.step_size <= 0.0) { n_not_perp++; continue; }
+
+            // ═══ NEW: skip stock perps (эвристика по префиксу) ═══
+            // Список известных stock-bases на Bybit (расширяй по мере надобности)
+            static const std::set<std::string> kStockBases = {
+                    "AAPL","TSLA","NVDA","GOOGL","AMZN","META","MSFT","NFLX",
+                    "PLTR","ARM","AXP","CSCO","COIN","MSTR","HOOD","IBIT",
+                    "MRVL","CRWV","NBIS","SOXL","SOXS","TQQQ","SQQQ","SPX",
+                    "QQQ","SPCX","EWY","SAMSUNG","SKHY","CRCL","AMD"
+            };
+            auto strip_usdt = [](const std::string& x) {
+                return (x.size() > 4 && x.substr(x.size()-4) == "USDT")
+                       ? x.substr(0, x.size()-4) : x;
+            };
+            std::string base = strip_usdt(s);
+            if (kStockBases.count(base)) { n_stock++; continue; }
+
+            scan_symbols.push_back(s);
+        }
+        std::cout << "[MAIN] Scanner filter: total=" << top.size()
+                  << " stable=" << n_stable
+                  << " dated=" << n_dated
+                  << " not_perp=" << n_not_perp
+                  << " stock=" << n_stock
+                  << " → keep=" << scan_symbols.size() << "\n";
+    }
+
+    ssl::context screener_ssl_ctx(ssl::context::tlsv12_client);
+    screener_ssl_ctx.set_default_verify_paths();
+
+    auto scanner = std::make_shared<ScannerClient>(
+            screener_ioc, screener_ssl_ctx, scan_symbols, *screener);
+
+    std::thread screener_thread([&screener_ioc, scanner, screener]() {
+        scanner->run("stream.bybit.com");
+        screener->start();
+        run_ioc_until_stopped(screener_ioc, "SCREENER");
+    });
+
     auto ws_client = std::make_shared<BybitWSClient>(
-            exec_ioc, exec_ssl_ctx, exec_symbols,
+            exec_ioc, exec_ssl_ctx, scan_symbols,
             nullptr, *api,
             "/v5/public/linear",
             /*auxiliary=*/false,
@@ -496,35 +585,6 @@ int main() {
                 ws->on_paper_fill(e);
             });
 
-    // ═══════════════════════════════════════════════════════════
-    // 6) Scanner
-    // ═══════════════════════════════════════════════════════════
-    net::io_context screener_ioc;
-    auto screener = std::make_shared<Screener>(screener_ioc, ConnStr);
-    screener->set_run_tag(run_tag);
-    screener->load(*api);
-
-    std::vector<std::string> scan_symbols;
-    {
-        auto top = api->get_top_liquid_symbols(screener->config().scan_top_n);
-        for (const auto& s : top) {
-            if (!registry->is_enabled(s)) continue;
-            scan_symbols.push_back(s);
-        }
-    }
-    std::cout << "[MAIN] Scanner: " << scan_symbols.size() << " symbols\n";
-
-    ssl::context screener_ssl_ctx(ssl::context::tlsv12_client);
-    screener_ssl_ctx.set_default_verify_paths();
-
-    auto scanner = std::make_shared<ScannerClient>(
-            screener_ioc, screener_ssl_ctx, scan_symbols, *screener);
-
-    std::thread screener_thread([&screener_ioc, scanner, screener]() {
-        scanner->run("stream.bybit.com");
-        screener->start();
-        run_ioc_until_stopped(screener_ioc, "SCREENER");
-    });
 
     // ═══════════════════════════════════════════════════════════
     // 7) Cleanup stale OPEN orders
@@ -554,42 +614,93 @@ int main() {
     std::thread exec_thread([&exec_ioc]() { run_ioc_until_stopped(exec_ioc, "EXEC"); });
 
     // ═══════════════════════════════════════════════════════════
-    // 9) Warmup
+    // 9) Warmup (умный: выход по стагнации прогресса)
     // ═══════════════════════════════════════════════════════════
-    std::cout << "[MAIN] warming up WS books...\n";
+    std::cout << "[MAIN] warming up WS books for "
+              << scan_symbols.size() << " symbols...\n";
     auto warmup_start    = std::chrono::steady_clock::now();
-    auto warmup_deadline = warmup_start + std::chrono::seconds(30);
+    auto warmup_deadline = warmup_start + std::chrono::seconds(500);
+    auto last_progress   = warmup_start;      // ← ДОБАВИТЬ
+    int  last_ready_real = 0;                 // ← ДОБАВИТЬ
+    int  last_ready      = -1;
 
     std::cout << clr::cyan << "Warming up WS books" << clr::reset << "\n";
-    int last_ready = -1;
     while (std::chrono::steady_clock::now() < warmup_deadline) {
         int ready = ws_client->count_symbols_with_book();
-        int total = static_cast<int>(exec_symbols.size());
+        int total = static_cast<int>(scan_symbols.size());
+
+        // ── отслеживание прогресса ──
+        if (ready != last_ready_real) {
+            last_progress   = std::chrono::steady_clock::now();
+            last_ready_real = ready;
+        }
+
         if (ready != last_ready) {
-            // ── Progress bar ──
             int pct = total > 0 ? (ready * 100 / total) : 0;
             int filled = ready * 30 / std::max(1, total);
             std::string bar;
             bar.reserve(30 * 3);
             for (int i = 0; i < filled; ++i) bar += "█";
             for (int i = 0; i < 30 - filled; ++i) bar += "░";
-            const char* color = pct == 100 ? clr::green : clr::yellow;
+            const char* color = pct >= 70 ? clr::green : clr::yellow;
             std::cout << "\r  " << color << "[" << bar << "]" << clr::reset
                       << "  " << pad_l(std::to_string(ready) + "/" + std::to_string(total), 7)
                       << "  " << pct << "%"
                       << std::flush;
             last_ready = ready;
         }
-        if (ready >= total) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        if (ready >= total * 70 / 100) break;
+
+        // ── стагнация: 90 сек без прогресса → выходим ──
+        auto stalled_for = std::chrono::steady_clock::now() - last_progress;
+        if (std::chrono::duration_cast<std::chrono::seconds>(stalled_for).count() > 90) {
+            std::cout << "\n";
+            std::cerr << "[WARMUP] no progress for 90s — stopping early\n";
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     std::cout << "\n\n";
+
     int final_ready = ws_client->count_symbols_with_book();
-    int final_total = static_cast<int>(exec_symbols.size());
-    if (final_ready < final_total) {
-        std::cout << "[MAIN] warmup partial: " << final_ready << "/" << final_total
-                  << " — " << (final_total - final_ready)
-                  << " symbols skipped\n";
+    std::cout << "[MAIN] warmup done: " << final_ready
+              << "/" << scan_symbols.size() << " ready\n";
+
+    // ═══ ДИАГНОСТИКА: какие символы не загрузились ═══
+    if (final_ready < static_cast<int>(scan_symbols.size())) {
+        std::set<std::string> with_book = ws_client->symbols_with_book();
+        std::vector<std::string> missing;
+        missing.reserve(scan_symbols.size());
+        for (const auto& s : scan_symbols) {
+            if (!with_book.count(s)) missing.push_back(s);
+        }
+        std::cerr << "[WARMUP-MISSING] " << missing.size()
+                  << " symbols без book data:\n";
+        for (size_t i = 0; i < missing.size() && i < 30; ++i) {
+            std::cerr << "  " << missing[i] << "\n";
+        }
+        if (missing.size() > 30) {
+            std::cerr << "  ... и ещё " << (missing.size() - 30) << "\n";
+        }
+    }
+
+// ═══ ДИАГНОСТИКА ═══
+    if (final_ready < static_cast<int>(scan_symbols.size())) {
+        std::set<std::string> with_book = ws_client->symbols_with_book();  // нужен accessor
+        std::vector<std::string> missing;
+        for (const auto& s : scan_symbols) {
+            if (!with_book.count(s)) missing.push_back(s);
+        }
+        std::cerr << "[WARMUP-MISSING] " << missing.size()
+                  << " symbols без book data:\n";
+        for (size_t i = 0; i < missing.size() && i < 30; ++i) {
+            std::cerr << "  " << missing[i] << "\n";
+        }
+        if (missing.size() > 30) {
+            std::cerr << "  ... и ещё " << (missing.size() - 30) << "\n";
+        }
     }
 
     if (paper_ptr != nullptr) {
@@ -605,9 +716,8 @@ int main() {
     // ═══════════════════════════════════════════════════════════
     // 10) Init MM
     // ═══════════════════════════════════════════════════════════
-    std::cout << "[MAIN] init_mm_strategies START (timeout 90s)\n";
+    std::cout << "[MAIN] init_mm_strategies START (timeout 240s)\n";
     std::atomic<bool> mm_done{false};
-    std::atomic<bool> mm_abort{false};
     std::thread mm_thread([&]() {
         try {
             ws_client->init_mm_strategies(*exchange);
@@ -642,12 +752,15 @@ int main() {
         if (ch_writer) std::cout << clr::green << "connected" << clr::reset;
         else           std::cout << clr::red << "disabled" << clr::reset;
         std::cout << "\n\n";
+
+        ws_client->start_registry_sync();
+        std::cout << clr::cyan << "[MAIN] Registry sync enabled (30s interval)"
+                  << clr::reset << "\n";
     } else {
-        std::cerr << "[MAIN] init_mm_strategies TIMEOUT 90s — "
+        std::cerr << "[MAIN] init_mm_strategies TIMEOUT 240s — "
                      "running WITHOUT MM (strategies="
                   << ws_client->currently_trading_symbols().size() << ")\n";
-        mm_thread.detach();   // висит в фоне, но main идёт дальше
-        // MM-tick НЕ запускаем — иначе segfault
+        mm_thread.detach();
     }
     std::cout << "[MAIN] running. Ctrl+C to stop. log: logs/mm.log\n";
 

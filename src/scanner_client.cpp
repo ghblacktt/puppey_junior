@@ -344,24 +344,21 @@ void ScannerClient::process_message(const char* data, std::size_t size) {
 
     // ═══════════ ORDERBOOK ═══════════
     if (topic.find("orderbook") != std::string_view::npos) {
-        // Биржевой timestamp
         uint64_t exchange_ts = 0;
         if (doc["ts"].get_uint64().get(exchange_ts) != simdjson::SUCCESS)
             exchange_ts = now_ms();
 
-        // update_type
         std::string update_type = "delta";
         std::string_view type_sv;
         if (doc["type"].get_string().get(type_sv) == simdjson::SUCCESS)
             update_type = std::string(type_sv);
 
-        // update_id
         uint64_t update_id = 0;
         if (data_field["u"].get_uint64().get(update_id) != simdjson::SUCCESS) {
             data_field["seq"].get_uint64().get(update_id);
         }
 
-        // Парсим bids/asks
+        // Parse levels (без изменений)
         std::vector<double> bp, bs, ap, as;
         simdjson::dom::array bids, asks;
         if (data_field["b"].get_array().get(bids) == simdjson::SUCCESS) {
@@ -391,7 +388,43 @@ void ScannerClient::process_message(const char* data, std::size_t size) {
             }
         }
 
-        // Сохраняем в ClickHouse
+        // ═══════════════════════════════════════════════════════
+        // FIX: локальная книга вместо bp[0]/ap[0].
+        // Bybit delta шлёт только изменённые уровни — bp[0] может быть
+        // не best bid. Применяем к локальной книге, BBO берём из неё.
+        // ═══════════════════════════════════════════════════════
+        auto& book = local_books_[symbol];
+
+        if (update_type == "snapshot") {
+            book.reset();
+        }
+
+        // Gap detection: пропущенный update_id → книга разошлась.
+        // Полный resubscribe — Sprint 7. Сейчас только лог, чтобы
+        // оператор увидел в логах и мог перезапустить процесс.
+        const uint64_t prev_id = book.last_update_id();
+        if (update_type == "delta" && prev_id > 0 && update_id > prev_id + 1) {
+            static std::atomic<uint64_t> s_gap_count{0};
+            const uint64_t n = s_gap_count.fetch_add(1, std::memory_order_relaxed);
+            if (n < 10 || n % 100 == 0) {
+                std::cerr << "[Scanner] OB gap " << symbol
+                          << " prev=" << prev_id << " cur=" << update_id
+                          << " (gap=" << (update_id - prev_id - 1) << ")\n";
+            }
+        }
+        book.set_update_id(update_id);
+
+        for (size_t i = 0; i < bp.size(); ++i) book.apply_bid(bp[i], bs[i]);
+        for (size_t i = 0; i < ap.size(); ++i) book.apply_ask(ap[i], as[i]);
+
+        // BBO из локальной книги
+        if (book.is_valid_bbo()) {
+            screener_.on_book_update(symbol,
+                                     book.best_bid(), book.best_ask(),
+                                     book.bid_size(), book.ask_size());
+        }
+
+        // ClickHouse — сырые delta (полезны для replay)
         if (book_writer_running_) {
             OrderbookUpdate u;
             u.symbol = symbol;
@@ -403,11 +436,6 @@ void ScannerClient::process_message(const char* data, std::size_t size) {
             u.ask_prices = std::move(ap);
             u.ask_sizes  = std::move(as);
             add_book_update(u);
-        }
-
-        // Screener
-        if (!bp.empty() && !ap.empty() && bp.size() >= 1 && ap.size() >= 1) {
-            screener_.on_book_update(symbol, bp[0], ap[0], bs[0], as[0]);
         }
     }
         // ═══════════ TRADES ═══════════
@@ -430,29 +458,71 @@ void ScannerClient::process_message(const char* data, std::size_t size) {
                 if (t["S"].get_string().get(side) == simdjson::SUCCESS)
                     tick.is_buyer_maker = (side == "Sell");
 
-                if (tick.price > 0 && tick.volume > 0 && trade_writer_running_) {
-                    add_trade_tick(tick);
+                if (tick.price > 0 && tick.volume > 0) {
+                    screener_.on_trade(tick.symbol, tick.price, tick.volume,
+                                       tick.is_buyer_maker, tick.timestamp_ms);
+                    if (trade_writer_running_) {
+                        add_trade_tick(tick);
+                    }
                 }
             }
         }
     }
 }
 
+ScannerClient::DebugBook
+ScannerClient::debug_book(const std::string& sym) const {
+    DebugBook out;
+    auto it = local_books_.find(sym);
+    if (it == local_books_.end()) return out;
+    const auto& b = it->second;
+    out.best_bid   = b.best_bid();
+    out.best_ask   = b.best_ask();
+    out.bid_size   = b.bid_size();
+    out.ask_size   = b.ask_size();
+    out.bid_levels = b.bid_levels();
+    out.ask_levels = b.ask_levels();
+    return out;
+}
+
 void ScannerClient::reconnect() {
     if (reconnecting_ || !running_) return;
     reconnecting_ = true;
-    if (++reconnect_attempts_ > 20) {
-        std::cerr << "[Scanner] max reconnect attempts\n";
+
+    // ── Отменяем все таймеры и закрываем WS (общая часть) ──
+    auto cleanup = [this]() {
+        ping_timer_.cancel();
+        subscribe_delay_timer_.cancel();
+        if (ws_) {
+            beast::error_code ec;
+            if (ws_->is_open()) ws_->close(websocket::close_code::normal, ec);
+            ws_.reset();
+        }
+        buffer_.clear();
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // FIX: после 20 неудач — 5 мин cooldown, потом reset counter
+    // и продолжать пробовать. Раньше после 20 попыток WS оставался
+    // мёртвым при running_=true → silent no-data → рваная история.
+    // ═══════════════════════════════════════════════════════════
+    if (reconnect_attempts_ >= 20) {
+        std::cerr << "[Scanner] 20 failed attempts, cooling down 5min\n";
+        cleanup();
+        reconnect_attempts_ = 0;   // сброс: следующая попытка — новая серия
+        reconnect_timer_.expires_after(std::chrono::minutes(5));
+        reconnect_timer_.async_wait([self = shared_from_this()](beast::error_code ec) {
+            if (ec) return;
+            self->reconnecting_ = false;
+            self->create_ws();
+            self->resolver_.async_resolve(self->host_, "443",
+                                          beast::bind_front_handler(&ScannerClient::on_resolve, self));
+        });
         return;
     }
-    ping_timer_.cancel();
-    subscribe_delay_timer_.cancel();
-    if (ws_) {
-        beast::error_code ec;
-        if (ws_->is_open()) ws_->close(websocket::close_code::normal, ec);
-        ws_.reset();
-    }
-    buffer_.clear();
+
+    ++reconnect_attempts_;
+    cleanup();
     reconnect_timer_.expires_after(std::chrono::seconds(5));
     reconnect_timer_.async_wait([self = shared_from_this()](beast::error_code ec) {
         if (ec) return;

@@ -5,11 +5,12 @@
 #include <iostream>
 #include <utility>
 #include "iexchange.h"
+#include <pqxx/pqxx>                          // pqxx::connection, pqxx::work, pqxx::txn
+#include "true_price/true_price_engine.h"     // tp::TruePriceEngine
+#include "cross_venue_signal.h"               // CrossVenueSignalEngine
+#include "regime_filter.h"                    // RegimeFilter
+#include "bybit/bybit_api_client.h"
 
-using arb::IExchange;
-// ============================================================
-// Local helpers
-// ============================================================
 namespace {
     inline auto mm_now_ms() -> uint64_t {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -23,200 +24,13 @@ namespace {
     }
 }
 
-namespace mm_cfg {
-
-// ─── Тайминги (ms) ──────────────────────────────────────────────
-    constexpr uint64_t kBlockLogIntervalMs       = 30'000;
-    constexpr uint64_t kTrendCutCooldownMs       = 60'000;
-    constexpr uint64_t kToxicCloseBlockMs        = 300'000;
-    constexpr uint64_t kBlacklistBlockMs         = 3'600'000;
-    constexpr uint64_t kPositionRefreshMs        = 20'000;
-    constexpr uint64_t kBookStaleMs              = 10'000;
-    constexpr uint64_t kPendingCloseTimeoutMs    = 45'000;
-    constexpr uint64_t kPendingCloseRetryBlockMs = 60'000;
-    constexpr uint64_t kMomentumMinAgeMs         = 500;
-    constexpr uint64_t kMomentumNoFillResetMs    = 3'000;
-    constexpr uint64_t kMomentumCloseTimeoutMs   = 4'000;
-    constexpr uint64_t kMomentumTier2AgeMs       = 5'000;
-    constexpr uint64_t kMomentumTier5AgeMs       = 10'000;
-    constexpr uint64_t kMomentumTier15AgeMs      = 20'000;
-    constexpr uint64_t kMinReplaceIntervalMs     = 5'000;
-    constexpr uint64_t kVpinPauseDurationMs      = 15'000;
-    constexpr uint64_t kBaseMaxHoldMs            = 300'000;
-    constexpr uint64_t kToxicMaxHoldMs           = 5'000;
-    constexpr uint64_t kMidHistoryWindowMs       = 60'000;
-    constexpr uint64_t kSigmaEmaIntervalMs       = 1'000;
-    constexpr uint64_t kMomentumDriftWindowMs    = 200;
-    constexpr uint64_t kDriftWindowMs            = 60'000;
-    constexpr uint64_t kStaleQuoteCooldownMs     = 1'000;
-    constexpr uint64_t kObiEmaIntervalMs         = 500;
-    constexpr uint64_t kFastAdverseMinAgeMs      = 5'000;
-    constexpr uint64_t kFastAdverseMaxAgeMs      = 30'000;
-    constexpr uint64_t kUrgencyAgeCapMs          = 30'000;
-    constexpr uint64_t kDriftLogIntervalMs       = 30'000;
-
-// ─── Пороги / эпсилоны ──────────────────────────────────────────
-    constexpr double   kPosEpsilon              = 1e-9;
-    constexpr double   kToxicThresholdBps       = -5.0;
-    constexpr double   kDustNotionalUsd         = 5.5;
-    constexpr double   kMinNotionalUsd          = 5.5;
-    constexpr double   kMaxHoldTriggerUsd       = 5.0;
-    constexpr double   kUrgencyMinUsd           = 1.0;
-    constexpr double   kUrgencyMaxUsd           = 20.0;
-    constexpr double   kSoftExitQtyRatio        = 0.15;
-    constexpr double   kSoftExitPnlPct          = -0.005;
-    constexpr double   kFastAdversePnlBps       = -15.0;
-
-// ─── Спреад / bps ───────────────────────────────────────────────
-    constexpr double   kMaxCrossBps             = 8.0;
-    constexpr double   kMinBpsFromTop           = 0.5;
-    constexpr int      kMinTicksFromTop         = 1;
-    constexpr double   kMomentumSpreadGateBps   = 35.0;
-    constexpr double   kMomentumHawkesGate      = 5.0;
-    constexpr double   kMomentumMinSpreadTicks  = 2.0;
-    constexpr double   kMinTrendThresholdPct    = 0.0020;
-
-// ── Классификация реального спреда (пороги, bps) ──
-// ОДИН источник истины для порогов
-    constexpr double kSpreadClassUltraWideBps = 50.0;
-    constexpr double kSpreadClassWideBps      = 30.0;
-    constexpr double kSpreadClassMidBps       = 15.0;
-    constexpr double kSpreadClassTightBps     = 8.0;
-    constexpr double kSpreadClassVeryTightBps = 3.0;
-
-// ── min_spread для каждого класса ──
-    constexpr double kMinSpreadUltraWideBps = 40.0;   // > 50 bps
-    constexpr double kMinSpreadWideBps      = 30.0;   // 30-50
-    constexpr double kMinSpreadMidBps       = 20.0;   // 15-30
-    constexpr double kMinSpreadTightBps     = 12.0;   // 8-15
-    constexpr double kMinSpreadVeryTightBps =  6.0;   // 3-8
-    constexpr double kMinSpreadUltraTightBps = 4.0;   // < 3
-
-// ── Fee floor ──
-    constexpr double kMinSpreadFeeMultiplier = 2.0;
-    constexpr double kMinSpreadFeePremiumBps = 1.0;
-
-    struct SpreadClass {
-        double threshold_bps;
-        double min_spread_bps;
-    };
-
-    constexpr std::array<SpreadClass, 6> kSpreadTable = {{
-                                                                 { .threshold_bps=kSpreadClassUltraWideBps, .min_spread_bps=kMinSpreadUltraWideBps },
-                                                                 { .threshold_bps=kSpreadClassWideBps,      .min_spread_bps=kMinSpreadWideBps      },
-                                                                 { .threshold_bps=kSpreadClassMidBps,       .min_spread_bps=kMinSpreadMidBps       },
-                                                                 { .threshold_bps=kSpreadClassTightBps,     .min_spread_bps=kMinSpreadTightBps     },
-                                                                 { .threshold_bps=kSpreadClassVeryTightBps, .min_spread_bps=kMinSpreadVeryTightBps },
-                                                                 { .threshold_bps=0.0,                      .min_spread_bps=kMinSpreadUltraTightBps },
-                                                         }};
-
-// ─── Skew / мультипликаторы ─────────────────────────────────────
-    constexpr double   kObiSkewMax              = 0.30;
-    constexpr double   kOfiSkewMax              = 0.15;
-    constexpr double   kHmaSkewMaxFactor        = 0.05;
-    constexpr double   kHmaSkewThresholdBps     = 0.5;
-    constexpr double   kHmaSkewScaleBps         = 30.0;
-    constexpr double   kMomentumMaxDriftPct     = 0.00005;
-    constexpr double   kQtyInventoryPenalty     = 0.7;
-    constexpr double   kToxicQtyMult            = 0.3;
-    constexpr double   kIlliquidQtyMult         = 0.5;
-    constexpr double   kToxicHalfSpreadMult     = 1.5;
-    constexpr double   kIlliquidHalfSpreadMult  = 2.0;
-    constexpr double   kToxicBlockRatio         = 0.30;
-    constexpr double   kPositionRiskBlockRatio  = 0.5;
-    constexpr double   kQtyRatioSoftExit        = 0.15;
-    constexpr double   kSkewUrgencyMult         = 1.5;
-
-// ─── OBI / OFI / VPIN ───────────────────────────────────────────
-    constexpr double   kObiEmaAlpha             = 0.3;
-    constexpr double   kObiEmaKeep              = 0.7;
-    constexpr double   kObiBlockThreshold       = 0.4;
-    constexpr double   kVpinMultThreshold       = 0.5;
-    constexpr double   kVpinMultSlope           = 2.0;
-    constexpr int      kVpinWindow              = 20;
-    constexpr int      kObiLevels               = 5;
-    constexpr int      kOfiSumLevels            = 100;
-
-// ─── Sigma / волатильность ─────────────────────────────────────
-    constexpr double   kSigmaEmaAlpha           = 0.05;
-    constexpr double   kStressVolRatioThreshold = 1.3;
-    constexpr double   kStressSpreadMultBase    = 1.5;
-    constexpr double   kSigmaRatioClampLo       = 0.5;
-    constexpr double   kSigmaRatioClampHi       = 3.0;
-
-// ─── Drift / stale ──────────────────────────────────────────────
-    constexpr double   kDriftThresholdMinBps    = 10.0;
-    constexpr double   kDriftThresholdSigmaMult = 1.5;
-    constexpr double   kStaleBidDistMinBps      = 10.0;
-    constexpr double   kStaleBidDistMaxBps      = 300.0;
-    constexpr double   kMoveThrTier1            = 2.0;
-    constexpr double   kMoveThrDefault          = 0.5;
-
-// ─── Дополнительные (для устранения остатков) ───────────────
-    constexpr double   kPctToBps                = 10'000.0;
-    constexpr double kTickRoundEpsilon          = 1e-9;
-
-// Инвентарь / действия
-    constexpr double   kMinInventoryUsdForAction   = 1.0;   // KILL, max-hold, urgency
-    constexpr double   kActionableInventoryUsd     = 5.0;   // TREND-cut, FAST_ADVERSE
-
-// Trend-cut
-    constexpr double   kTrendThresholdSpreadFactor = 0.3;
-    constexpr double   kMinTrendThresholdBps       = 20.0;
-
-// Inventory penalty
-    constexpr double   kInvPenaltyQuadFactor       = 0.5;
-
-// Side-bias half-spread
-    constexpr double   kSideBiasActivationRatio    = 0.05;
-    constexpr double   kSideBiasHalfSpreadSlope    = 0.5;
-
-// OFI clamp
-    constexpr double   kOfiNormClampAbs            = 3.0;
-
-// Tick-size discovery
-    constexpr double   kTickProbeMult              = 1.001;
-    constexpr double   kTickFallbackFraction       = 0.0001;
-
-// Gap from BBO
-    constexpr double   kMinGapBps                  = 1.0;
-
-// Momentum close replace
-    constexpr double   kMomentumCloseReplaceTicks  = 2.0;
-
-// Drift threshold
-    constexpr double   kDriftSigmaSeconds          = 60.0;
-
-// Toxic-markout filter
-    constexpr uint32_t kToxicMinMarkouts4h         = 20;
-    constexpr double   kToxicMinHitPct1s           = 20.0;
-
-// Momentum history
-    constexpr size_t   kMinHistoryForMomentum      = 3;
-
-    constexpr double kHalfTickFactor = 0.5;
-    constexpr double kOneTickFactor  = 1.0;
-    constexpr double kTwoTicksFactor = 2.0;
-
-    [[nodiscard]] static auto floorToTick(double p, double tick) noexcept -> double
-    {
-        return std::floor((p / tick) + kTickRoundEpsilon) * tick;
-    }
-
-    [[nodiscard]] static auto ceilToTick(double p, double tick) noexcept -> double
-    {
-        return std::ceil((p / tick) - kTickRoundEpsilon) * tick;
-    }
-
-} // namespace mm_cfg
-
 // ============================================================
 // Конструктор
 // ============================================================
 MarketMakingStrategy::MarketMakingStrategy(
         OrderBook& orderbook,
         ClusterEngine& cluster,
-        IExchange& exchange,
+        arb::IExchange& exchange,
         std::string  symbol,
         double base_spread_pct,
         double order_qty_usd,
@@ -244,6 +58,12 @@ auto MarketMakingStrategy::refresh_position() -> bool {
 
     if (pos.rate_limited) {
         return false;
+    }
+
+    const uint64_t now_ms = this->now();
+    if (last_fill_processed_ms_ > 0
+        && now_ms - last_fill_processed_ms_ < mm_cfg::kRefreshAfterFillCooldownMs) {
+        return true;
     }
 
     if (!pos.is_valid) {
@@ -493,7 +313,31 @@ void MarketMakingStrategy::tick()
 
     const uint64_t now = this->now();
 
+    // ═════════════════════════════════════════════════════════════
+    // 0. Применить накопленные fills (из ASIO fill-thread)
+    //    ВАЖНО: до handleEarlyExits, чтобы даже в blocked-состоянии
+    //    inventory оставался актуальным.
+    // ═════════════════════════════════════════════════════════════
+    process_deferred_fills(now);
+
+    if (shutting_down_.load(std::memory_order_acquire)) {
+        if (!shutdown_complete_.exchange(true, std::memory_order_acq_rel)) {
+            shutdown_do_work("SHUTDOWN");
+        }
+        return;
+    }
+
     logBlockingState(now);
+
+    // ═════════════════════════════════════════════════════════════
+    // 0b. Decay adverse_fill_count_ после тихого периода.
+    //     Без этого 2 adverse-close за всё время = вечный бан.
+    // ═════════════════════════════════════════════════════════════
+    if (adverse_fill_count_ > 0 && last_adverse_close_ms_ > 0
+        && now - last_adverse_close_ms_ > 600'000) {   // 10 мин
+        adverse_fill_count_ = 0;
+        last_adverse_close_ms_ = 0;
+    }
 
     if (handleEarlyExits(now)) {
         return;
@@ -502,11 +346,22 @@ void MarketMakingStrategy::tick()
     // ═════════════════════════════════════════════════════════════
     // 1. Обработка pending cancel от fill-tracker
     // ═════════════════════════════════════════════════════════════
-    if (pending_cancel_ask_.exchange(false, std::memory_order_relaxed)) {
-        cancel_ask_now("TOXIC_THROUGH");
+    if (pending_cancel_ask_.exchange(false, std::memory_order_seq_cst)) {
+        const double trigger = pending_cancel_ask_trigger_.exchange(
+                -kNoPriceSentinel, std::memory_order_seq_cst);
+        // Трейд прошёл на уровне >= нашей ask → нас пробили
+        if (!ask_order_id_.empty() && last_ask_p_ > 0.0
+            && trigger >= last_ask_p_ - 1e-9) {
+            cancel_ask_now("TOXIC_THROUGH");
+        }
     }
-    if (pending_cancel_bid_.exchange(false, std::memory_order_relaxed)) {
-        cancel_bid_now("TOXIC_THROUGH");
+    if (pending_cancel_bid_.exchange(false, std::memory_order_seq_cst)) {
+        const double trigger = pending_cancel_bid_trigger_.exchange(
+                kNoPriceSentinel, std::memory_order_seq_cst);
+        if (!bid_order_id_.empty() && last_bid_p_ > 0.0
+            && trigger <= last_bid_p_ + 1e-9) {
+            cancel_bid_now("TOXIC_THROUGH");
+        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -618,7 +473,7 @@ void MarketMakingStrategy::tick()
     }
 
     // ═════════════════════════════════════════════════════════════
-    // 15. История и trend-cut
+    // 15. Volatility / stress and trend-cut
     // ═════════════════════════════════════════════════════════════
     pushMidHistory(now, mid);
     hma_fast_.on_mid(now, mid);
@@ -628,19 +483,16 @@ void MarketMakingStrategy::tick()
     const double hma_skew_bps = compute_hma_skew_bps();
     hma_skew_bps_ = hma_skew_bps;
 
-    if (handleTrendCut(now, mid, best_bid, best_ask)) {
-        return;
-    }
-
-    // ═════════════════════════════════════════════════════════════
-    // 16. Volatility / stress
-    // ═════════════════════════════════════════════════════════════
     const auto vol = computeVolatility(now);
     if (vol.cancel_all) {
         cancelAllOrders("");
         return;
     }
     const double sigma = vol.sigma;
+
+    if (handleTrendCut(now, mid, best_bid, best_ask, sigma)) {
+        return;
+    }
 
     // ═════════════════════════════════════════════════════════════
     // 17. Расчёт спреда
@@ -841,11 +693,23 @@ void MarketMakingStrategy::cancelStaleIfNeeded(QuoteSide side, double mid, uint6
                             ? (mid - last_px) / last_px * mm_cfg::kPctToBps
                             : (last_px - mid) / last_px * mm_cfg::kPctToBps;
 
-    // Cancel ТОЛЬКО если mid близко к нашему ордеру (adverse imminent)
-    // Верхний порог УБРАН — на волатильных символах mid ходит на ±40 bps,
-    // и dist > 50 срабатывал каждые 100 мс → 0 fills
-    if (dist_bps >= mm_cfg::kStaleBidDistMinBps) {
-        return;   // далеко = ok, не отменяем
+// ═══ АДАПТИВНЫЙ порог: не отменять если наш ордер в "нормальной" зоне ═══
+// min_bps зависит от текущего спреда символа:
+//   спред 4 bps → min = 1 bps (cancel только если mid почти на нашей цене)
+//   спред 20 bps → min = 3 bps
+//   спред 50+ bps → min = 5 bps
+    double bb_now = orderbook_.get_best_bid();
+    double ba_now = orderbook_.get_best_ask();
+    double spread_now_bps = (ba_now > bb_now && bb_now > 0)
+                            ? (ba_now - bb_now) / mid * mm_cfg::kPctToBps
+                            : 0.0;
+    double min_bps = std::clamp(spread_now_bps * 0.20, 1.0, 5.0);   // 20% от спреда, 1-5 bps
+
+// Верхний порог убираем совсем — если mid ушёл далеко, пусть `bid_needs_replace` его переставит
+// Но защищаемся от явных аномалий (mid > 500 bps от ордера — точно что-то не так)
+
+    if (dist_bps >= min_bps && dist_bps <= mm_cfg::kAbsoluteMaxBps) {
+        return;   // ордер в нормальной зоне, не трогаем
     }
 
     api_.cancel_order(symbol_, oid);
@@ -973,10 +837,37 @@ void MarketMakingStrategy::prune_placed_orders(uint64_t now) {
 // ============================================================
 void MarketMakingStrategy::on_order_filled(const std::string& order_id,
                                            uint64_t fill_ts_ms,
-                                           double fill_price,
-                                           double fill_qty,
+                                           double   fill_price,
+                                           double   fill_qty,
                                            const std::string& side,
-                                           bool is_full_fill) {
+                                           bool     is_full_fill) {
+    std::lock_guard<std::mutex> lk(deferred_fill_mtx_);
+    deferred_fills_.push_back({order_id, fill_ts_ms, fill_price,
+                               fill_qty, side, is_full_fill});
+}
+
+void MarketMakingStrategy::process_deferred_fills(uint64_t /*now*/) {
+    std::vector<DeferredFill> batch;
+    {
+        std::lock_guard<std::mutex> lk(deferred_fill_mtx_);
+        if (deferred_fills_.empty()) return;
+        batch.swap(deferred_fills_);
+    }
+    for (const auto& f : batch) {
+        apply_fill_internal(f.order_id, f.fill_ts_ms, f.fill_price,
+                            f.fill_qty, f.side, f.is_full_fill);
+        if (f.fill_ts_ms > last_fill_processed_ms_)
+            last_fill_processed_ms_ = f.fill_ts_ms;
+    }
+}
+
+void MarketMakingStrategy::apply_fill_internal(
+        const std::string& order_id,
+        uint64_t fill_ts_ms,
+        double   fill_price,
+        double   fill_qty,
+        const std::string& side,
+        bool     is_full_fill) {
     double      p = fill_price;
     std::string s = side;
 
@@ -1048,6 +939,7 @@ void MarketMakingStrategy::on_order_filled(const std::string& order_id,
             if (m.fair_price_at_fill <= 0.0)
                 m.fair_price_at_fill = p;
             m.fill_time_ms = ts;
+            m.is_close     = false;
             static std::atomic<uint64_t> _fill_seq{0};
             std::string markout_key = order_id + "_" + std::to_string(_fill_seq.fetch_add(1));
             pending_markouts_[markout_key] = m;
@@ -1081,6 +973,7 @@ void MarketMakingStrategy::on_order_filled(const std::string& order_id,
             m.fill_price = p;
             m.fair_price_at_fill = orderbook_.get_mid_price();
             m.fill_time_ms = ts;
+            m.is_close     = true;
             pending_markouts_[order_id + "_close_" + std::to_string(ts)] = m;
         }
 
@@ -1095,6 +988,7 @@ void MarketMakingStrategy::on_order_filled(const std::string& order_id,
 
             if (pnl_bps < -20.0) {
                 adverse_fill_count_++;
+                last_adverse_close_ms_ = this->now();
                 close_blocked_until_ = this->now() + 300'000;   // 5 мин
                 std::cerr << "[MM-POST-LOSS] " << symbol_
                           << " close_side=" << s
@@ -1139,36 +1033,18 @@ void MarketMakingStrategy::on_order_filled(const std::string& order_id,
 
     // cooldown 10s
     uint64_t _now = this->now();
-    if (s == "Buy")  bid_cooldown_until_ = _now + 10'000;
-    if (s == "Sell") ask_cooldown_until_ = _now + 10'000;
+    if (s == "Buy")  bid_cooldown_until_ = _now + 3'000;
+    if (s == "Sell") ask_cooldown_until_ = _now + 3'000;
 }
 
 // ============================================================
 // TOXIC DETECTION
 // ============================================================
-void MarketMakingStrategy::on_trade_through_bid(double trade_price, double qty) {
-    if (bid_order_id_.empty()) return;
-    if (last_bid_p_ <= 0.0) return;
-    if (trade_price > last_bid_p_ + 1e-9) return;   // трейд не через наш bid
-
-    // ═══ СИНХРОННЫЙ cancel, не pending ═══
-    api_.cancel_order(symbol_, bid_order_id_);
-    log_cancel(bid_order_id_, "TRADE_THROUGH");
-    bid_order_id_.clear();
-    last_bid_p_ = 0.0;
-    bid_cooldown_until_ = this->now() + 1'000;
+void MarketMakingStrategy::on_trade_through_bid(double trade_price, double /*qty*/) {
+    cancel_bid_on_through(trade_price, "TRADE_THROUGH");
 }
-
-void MarketMakingStrategy::on_trade_through_ask(double trade_price, double qty) {
-    if (ask_order_id_.empty()) return;
-    if (last_ask_p_ <= 0.0) return;
-    if (trade_price < last_ask_p_ - 1e-9) return;
-
-    api_.cancel_order(symbol_, ask_order_id_);
-    log_cancel(ask_order_id_, "TRADE_THROUGH");
-    ask_order_id_.clear();
-    last_ask_p_ = 0.0;
-    ask_cooldown_until_ = this->now() + 1'000;
+void MarketMakingStrategy::on_trade_through_ask(double trade_price, double /*qty*/) {
+    cancel_ask_on_through(trade_price, "TRADE_THROUGH");
 }
 
 // ============================================================
@@ -1425,9 +1301,9 @@ void MarketMakingStrategy::processPendingClose(uint64_t now,
 // ============================================================
 // Momentum mode
 // ============================================================
-bool MarketMakingStrategy::handleMomentumMode(uint64_t now, double mid,
+auto MarketMakingStrategy::handleMomentumMode(uint64_t now, double mid,
                                               double best_bid, double best_ask,
-                                              double tick_size)
+                                              double tick_size) -> bool
 {
     const double hawkes = tp_engine_->target_skew_bps(now);
 
@@ -1617,9 +1493,24 @@ bool MarketMakingStrategy::handleMomentumMode(uint64_t now, double mid,
 // ============================================================
 // Max-hold
 // ============================================================
-bool MarketMakingStrategy::handleMaxHold(uint64_t now, double mid,
-                                         double best_bid, double best_ask)
+auto MarketMakingStrategy::handleMaxHold(uint64_t now, double mid,
+                                         double best_bid, double best_ask) -> bool
 {
+    if (std::abs(inventory_qty_) > mm_cfg::kPosEpsilon) {
+        const double pos_notional = std::abs(inventory_qty_) * mid;
+        if (pos_notional > 0.0 && pos_notional < mm_cfg::kDustNotionalUsd) {
+            std::cerr << "[MM-DUST] " << symbol_
+                      << " qty=" << inventory_qty_
+                      << " notional=$" << std::fixed << std::setprecision(4) << pos_notional
+                      << " — write off\n" << std::defaultfloat;
+            inventory_qty_        = 0.0;
+            inventory_usd_        = 0.0;
+            inventory_side_.clear();
+            position_opened_time_ = 0;
+            return true;
+        }
+    }
+
     const double abs_inv = std::abs(inventory_usd_);
     if (abs_inv <= mm_cfg::kMinInventoryUsdForAction || position_opened_time_ == 0) {
         return false;
@@ -1641,15 +1532,6 @@ bool MarketMakingStrategy::handleMaxHold(uint64_t now, double mid,
         return false;
     }
 
-    // dust
-    const double pos_notional = std::abs(inventory_qty_) * mid;
-    if (pos_notional < mm_cfg::kDustNotionalUsd) {
-        inventory_qty_        = 0.0;
-        inventory_usd_        = 0.0;
-        position_opened_time_ = 0;
-        return true;
-    }
-
     if (std::abs(inventory_qty_) <= mm_cfg::kPosEpsilon) {
         return true;
     }
@@ -1668,25 +1550,28 @@ bool MarketMakingStrategy::handleMaxHold(uint64_t now, double mid,
         close_blocked_until_            = now + mm_cfg::kPendingCloseTimeoutMs;
         std::cout << "[MM] " << symbol_ << " CLOSE MAKER [MAX_HOLD] ...\n";
     } else {
-        close_position_market(best_bid, best_ask, "MAX_HOLD_FALLBACK");
-        close_blocked_until_ = now + mm_cfg::kPendingCloseRetryBlockMs;
+        // ═══ НЕ market close — пробуем снова через 500ms ═══
+        // Taker fee (5.5 bps) × 2 = -11 bps на круг — это больше среднего edge
+        std::cerr << "[MM] " << symbol_ << " MAX_HOLD place failed (rc="
+                  << api_.last_ret_code() << ") — retry 500ms\n";
+        close_blocked_until_ = now + 500;   // короткая пауза, повторим
+        // НЕ вызываем close_position_market
     }
     return true;
 }
 
-MarketMakingStrategy::SideGates
-MarketMakingStrategy::evaluateGates(const GateInputs& in)
+auto MarketMakingStrategy::evaluateGates(const GateInputs& in) -> MarketMakingStrategy::SideGates
 {
     using namespace mm_cfg;
-    SideGates g;
+    SideGates gates;
 
     auto block_bid = [&](const char* why) noexcept {
-        g.allow_bid = false;
-        g.bid_block_reason = why;
+        gates.allow_bid = false;
+        gates.bid_block_reason = why;
     };
     auto block_ask = [&](const char* why) noexcept {
-        g.allow_ask = false;
-        g.ask_block_reason = why;
+        gates.allow_ask = false;
+        gates.ask_block_reason = why;
     };
 
     // 1. Цена пересекает противоположный BBO / за пределом block_ratio
@@ -1723,24 +1608,20 @@ MarketMakingStrategy::evaluateGates(const GateInputs& in)
     if (in.drift_bps < -in.drift_thr_bps) { block_bid("DRIFT_DOWN"); }
     if (in.drift_bps >  in.drift_thr_bps) { block_ask("DRIFT_UP");   }
 
-    return g;
+    return gates;
 }
 
 // ============================================================
 // Trend-cut
 // ============================================================
 bool MarketMakingStrategy::handleTrendCut(uint64_t now, double mid,
-                                          double best_bid, double best_ask)
+                                          double best_bid, double best_ask,
+                                          double sigma)
 {
-    double trend_thr_bps;
-    if (trend_thr_override_bps_ > 0.0) {
-        trend_thr_bps = trend_thr_override_bps_;
-    } else {
-        const double base_bps = base_spread_pct_
-                                * mm_cfg::kTrendThresholdSpreadFactor
-                                * mm_cfg::kPctToBps;
-        trend_thr_bps = std::max(base_bps, mm_cfg::kMinTrendThresholdBps);
-    }
+    double sigma_bps = sigma * 10000.0;
+    double adaptive_trend_bps = 2.5 * sigma_bps * std::sqrt(60.0);
+    double trend_thr_bps = std::max(40.0, adaptive_trend_bps);
+    double trend_thr = trend_thr_bps / 10000.0;
 
     const double drift_bps = computeDrift60sBps(now, mid);
     if (std::abs(drift_bps) <= trend_thr_bps) {
@@ -1750,7 +1631,19 @@ bool MarketMakingStrategy::handleTrendCut(uint64_t now, double mid,
     cancelAllOrders(nullptr);
 
     if (std::abs(inventory_usd_) > mm_cfg::kActionableInventoryUsd) {
-        close_position_market(best_bid, best_ask, "TREND");
+        // ═══ TREND = риск → taker close, не ждём maker fill ═══
+        std::string close_side = (inventory_qty_ > 0) ? "Sell" : "Buy";
+        double close_qty = std::abs(inventory_qty_);
+
+        // Прямой market order
+        std::string oid = api_.place_market_order(symbol_, close_side, close_qty);
+        if (!oid.empty()) {
+            std::cout << "[MM] " << symbol_ << " CLOSE MARKET [TREND] "
+                      << close_side << " qty=" << close_qty << " oid=" << oid << "\n";
+        } else {
+            // fallback — если market недоступен, maker close
+            close_position_market(best_bid, best_ask, "TREND_FALLBACK");
+        }
         return true;
     }
     last_trend_cut_ms_ = now;
@@ -1788,7 +1681,7 @@ auto MarketMakingStrategy::computeMomentumSkew(uint64_t now, double mid) const -
     return drift * mid * momentum_weight_;
 }
 
-double MarketMakingStrategy::computeTimeUrgency(uint64_t now) const
+auto MarketMakingStrategy::computeTimeUrgency(uint64_t now) const -> double
 {
     if (position_opened_time_ == 0) {
         return 0.0;
@@ -1806,7 +1699,7 @@ double MarketMakingStrategy::computeTimeUrgency(uint64_t now) const
     return age_ratio * age_ratio;
 }
 
-double MarketMakingStrategy::computeDrift60sBps(uint64_t now, double mid) const
+auto MarketMakingStrategy::computeDrift60sBps(uint64_t now, double mid) const -> double
 {
     const double mid_ago = findMidAgo(now, mm_cfg::kDriftWindowMs, mid);
     if (mid_ago <= 0.0) {
@@ -1815,9 +1708,9 @@ double MarketMakingStrategy::computeDrift60sBps(uint64_t now, double mid) const
     return (mid - mid_ago) / mid_ago * mm_cfg::kPctToBps;
 }
 
-double MarketMakingStrategy::findMidAgo(uint64_t now,
+auto MarketMakingStrategy::findMidAgo(uint64_t now,
                                         uint64_t window_ms,
-                                        double fallback) const
+                                        double fallback) const -> double
 {
     if (mid_history_.empty()) {
         return fallback;
@@ -2114,7 +2007,13 @@ auto MarketMakingStrategy::computeReplaceFlags(
 
     r.bid = (last_bid_p_ == 0.0)
             || (std::abs(last_bid_p_ - bid_price) / bid_half > bid_thr);
-    if (now - last_bid_place_ms_ < kMinReplaceIntervalMs && !bid_order_id_.empty()) {
+// Dynamic: 5s для toxic, 30s для normal (дольше держим, fills улучшаются)
+    uint64_t bid_interval = mm_cfg::kMinReplaceIntervalMs;
+    if (regime_.bid.mode == mm::SymMode::Normal)       bid_interval = 30'000;
+    else if (regime_.bid.mode == mm::SymMode::Tier1)   bid_interval = 10'000;
+// Toxic → 5000 (по умолчанию — быстро уходим)
+
+    if (now - last_bid_place_ms_ < bid_interval && !bid_order_id_.empty()) {
         r.bid = false;
     }
 
@@ -2167,7 +2066,6 @@ bool MarketMakingStrategy::handleEarlyExits(uint64_t now) const
 {
     using namespace mm_cfg;
 
-    if (shutting_down_)                                                            { return true; }
     if (now < close_blocked_until_)                                                { return true; }
     if (last_trend_cut_ms_ > 0 && now - last_trend_cut_ms_ < kTrendCutCooldownMs)  { return true; }
     return false;
@@ -2384,6 +2282,7 @@ void MarketMakingStrategy::update_pending_markouts(uint64_t now) {
                 fm.mid_1s             = m.mids[2];
                 fm.mid_5s             = m.mids[3];
                 fm.mid_30s            = m.mids[4];
+                fm.is_close           = m.is_close;
 
                 auto sign = (m.side == "Buy") ? 1.0 : -1.0;
                 auto mk_bps = [&](double mk_mid) -> double {
@@ -2426,8 +2325,8 @@ void MarketMakingStrategy::persist_markout(const PendingMarkout& m) {
                 "(order_id, symbol, side, qty, fill_price, fill_time_ms, run_tag, "
                 " fair_price_at_fill, mid_100ms, mid_500ms, mid_1s, mid_5s, mid_30s, "
                 " mk_100ms_bps, mk_500ms_bps, mk_1s_bps, mk_5s_bps, mk_30s_bps, "
-                " finalized) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,true) "
+                " finalized, is_close) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,true,$19) "
                 "ON CONFLICT (order_id) DO NOTHING",
                 pqxx::params{
                         m.order_id, symbol_, m.side, m.qty, m.fill_price,
@@ -2435,7 +2334,8 @@ void MarketMakingStrategy::persist_markout(const PendingMarkout& m) {
                         m.fair_price_at_fill,
                         m.mids[0], m.mids[1], m.mids[2], m.mids[3], m.mids[4],
                         mk_bps(m.mids[0]), mk_bps(m.mids[1]), mk_bps(m.mids[2]),
-                        mk_bps(m.mids[3]), mk_bps(m.mids[4])
+                        mk_bps(m.mids[3]), mk_bps(m.mids[4]),
+                        m.is_close
                 });
         txn.commit();
     } catch (const std::exception& e) {
@@ -2479,18 +2379,39 @@ MarketMakingStrategy::drain_finalized_markouts() {
     return out;
 }
 
-void MarketMakingStrategy::cancel_ask_on_through(double trade_price, const std::string& reason) {
-    if (ask_order_id_.empty()) return;
-    if (last_ask_p_ <= 0.0) return;
-    if (trade_price < last_ask_p_ - 1e-9) return;
-    cancel_ask_now(reason);
+// ============================================================
+// cancel_ask_on_through / cancel_bid_on_through
+// EDGE из WS thread. Единственная разрешённая операция — атомарно
+// записать trigger. Вся работа с ask_order_id_/last_ask_p_/API — в tick().
+// ============================================================
+void MarketMakingStrategy::cancel_ask_on_through(double trade_price,
+                                                 const std::string& /*reason*/) {
+    if (trade_price <= 0.0) return;
+    // CAS-keep-max: худший (самый высокий) ask-трейд за интервал
+    double cur = pending_cancel_ask_trigger_.load(std::memory_order_seq_cst);
+    while (trade_price > cur) {
+        if (pending_cancel_ask_trigger_.compare_exchange_weak(
+                cur, trade_price,
+                std::memory_order_seq_cst, std::memory_order_seq_cst)) {
+            break;
+        }
+    }
+    pending_cancel_ask_.store(true, std::memory_order_seq_cst);
 }
 
-void MarketMakingStrategy::cancel_bid_on_through(double trade_price, const std::string& reason) {
-    if (bid_order_id_.empty()) return;
-    if (last_bid_p_ <= 0.0) return;
-    if (trade_price > last_bid_p_ + 1e-9) return;
-    cancel_bid_now(reason);
+void MarketMakingStrategy::cancel_bid_on_through(double trade_price,
+                                                 const std::string& /*reason*/) {
+    if (trade_price <= 0.0) return;
+    // CAS-keep-min: худший (самый низкий) bid-трейд за интервал
+    double cur = pending_cancel_bid_trigger_.load(std::memory_order_seq_cst);
+    while (trade_price < cur) {
+        if (pending_cancel_bid_trigger_.compare_exchange_weak(
+                cur, trade_price,
+                std::memory_order_seq_cst, std::memory_order_seq_cst)) {
+            break;
+        }
+    }
+    pending_cancel_bid_.store(true, std::memory_order_seq_cst);
 }
 
 void MarketMakingStrategy::cancel_ask_now(const std::string& reason) {
@@ -2584,19 +2505,44 @@ MarketMakingStrategy::MomentumSignal MarketMakingStrategy::compute_momentum_sign
     return sig;
 }
 
+// ============================================================
+// shutdown_gracefully — signal-only.
+// Реальная работа — shutdown_do_work(), на tick-thread.
+//
+// Для тестов / backtest (has_exec_==false): shutdown_do_work()
+// выполняется прямо здесь, т.к. нет параллельного tick().
+//
+// Для live (has_exec_==true): ставим флаг, следующий tick()
+// выполнит cleanup и выставит shutdown_complete_.
+// Внешний код ОБЯЗАН дождаться is_shutdown_complete()==true
+// (с таймаутом) перед остановкой io_context.
+// ============================================================
 void MarketMakingStrategy::shutdown_gracefully(const std::string& reason) {
-    if (shutting_down_) return;
-    shutting_down_ = true;
+    if (shutting_down_.exchange(true)) return;   // already shutting down
 
-    std::cout << "[MM] " << symbol_ << " shutdown_gracefully: " << reason << "\n";
+    std::cout << "[MM] " << symbol_ << " shutdown: " << reason << "\n";
 
-    // 1) Отменить открытые bid/ask
+    if (!has_exec_) {
+        // Test / backtest: no concurrent tick(), direct call
+        shutdown_do_work(reason);
+        shutdown_complete_.store(true, std::memory_order_release);
+    }
+    // else: next tick() will pick up shutting_down_ and run cleanup
+}
+
+// ============================================================
+// shutdown_do_work — actual cleanup. MUST run on tick-thread
+// (or in single-threaded test/backtest context).
+// ============================================================
+void MarketMakingStrategy::shutdown_do_work(const std::string& reason) {
+    // 1) Cancel bid
     if (!bid_order_id_.empty()) {
         api_.cancel_order(symbol_, bid_order_id_);
         log_cancel(bid_order_id_, reason);
         bid_order_id_.clear();
         last_bid_p_ = 0.0;
     }
+    // 2) Cancel ask
     if (!ask_order_id_.empty()) {
         api_.cancel_order(symbol_, ask_order_id_);
         log_cancel(ask_order_id_, reason);
@@ -2604,7 +2550,7 @@ void MarketMakingStrategy::shutdown_gracefully(const std::string& reason) {
         last_ask_p_ = 0.0;
     }
 
-    // 2) Если позиция значимая — закрыть market-ом, чтобы не висела orphan
+    // 3) Close position if significant
     constexpr double kMinCloseUsd = 1.0;
     if (std::abs(inventory_usd_) > kMinCloseUsd) {
         double best_bid = orderbook_.get_best_bid();
@@ -2616,11 +2562,12 @@ void MarketMakingStrategy::shutdown_gracefully(const std::string& reason) {
                       << " on shutdown\n";
         } else {
             std::cerr << "[MM] " << symbol_
-                      << " cannot close (no book), orphan pos=$" << inventory_usd_ << "\n";
+                      << " cannot close (no book), orphan pos=$"
+                      << inventory_usd_ << "\n";
         }
     } else if (std::abs(inventory_usd_) > 1e-9) {
         std::cout << "[MM] " << symbol_
                   << " position $" << inventory_usd_
-                  << " below min ($" << kMinCloseUsd << "), left as orphan\n";
+                  << " below min, left as orphan\n";
     }
 }

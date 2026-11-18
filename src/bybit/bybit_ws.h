@@ -76,7 +76,13 @@ public:
                   bool auxiliary,
                   const std::string& pg_conn_str);
     ~BybitWSClient();
-
+    std::set<std::string> symbols_with_book() const {
+        std::set<std::string> out;
+        for (const auto& [sym, state] : tickers_) {
+            if (state->orderbook.get_mid_price() > 0.0) out.insert(sym);
+        }
+        return out;
+    }
     void init_mm_strategies(IExchange& exchange);
     void on_paper_fill(const arb::ExchangeExecution& e);
     void set_paper_exchange(PaperExchange* p) { paper_exchange_ = p; }
@@ -112,7 +118,9 @@ public:
         return bitunix_symbols_.count(symbol) > 0;
     }
     void start_mm_tick();
+    void start_registry_sync();
 private:
+    net::steady_timer registry_sync_timer_;
     void scan_momentum_candidates();
     uint64_t last_momentum_scan_ms_ = 0;
     void start_regime_update();

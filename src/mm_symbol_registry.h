@@ -59,6 +59,17 @@ public:
                     double fee_usd,
                     const std::string& verdict);
 
+    // ═══ Helper: per-symbol параметры для screener и paper ═══
+// Возвращает min_hs_bps для symbol. Если override не задан —
+// default по price tier (как в create_mm_for_symbol)
+    double effective_min_hs_bps(const std::string& symbol, double px) const;
+
+// Возвращает max_hold_sec для symbol. Если override не задан — default.
+    int effective_max_hold_sec(const std::string& symbol) const;
+
+// Универсальный default по цене (используется в paper + screener)
+    static double default_min_hs_bps_for_price(double px);
+
 private:
     explicit MmSymbolRegistry(const std::string& conn_str);
 

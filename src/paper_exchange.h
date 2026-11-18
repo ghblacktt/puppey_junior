@@ -1,6 +1,7 @@
 #pragma once
 #include "iexchange.h"
 #include "bybit/bybit_api_client.h"
+#include "fill_model.h"
 #include <atomic>
 #include <functional>
 #include <map>
@@ -119,6 +120,7 @@ namespace arb {
         double realized_pnl_ = 0.0;
 
         std::map<std::string, POrder> orders_;
+        mm::FillModel fill_model_;
         std::map<std::string, PPos>   positions_;
         std::map<std::string, std::vector<PExec>> executions_;
         std::map<std::string, BBOInfo> bbo_;              // extended

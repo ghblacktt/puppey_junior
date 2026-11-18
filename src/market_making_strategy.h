@@ -1,33 +1,224 @@
 #pragma once
-#include <string>
-#include <memory>
+
+#include <array>
+#include <atomic>
 #include <chrono>
-#include <deque>
-#include <utility>
-#include <map>
-#include <algorithm>
 #include <cmath>
-#include <pqxx/pqxx>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace pqxx { class connection; }
+namespace tp   { class TruePriceEngine; }
 #include "order_book.h"
+
 #include "cluster_engine.h"
-#include "bybit/bybit_api_client.h"
+#include "iexchange.h"
 #include "fill_outcome_tracker.h"
 #include "adaptive_controller.h"
-#include "regime_filter.h"
-#include "iexchange.h"
-#include "cross_venue_signal.h"
-#include <array>
-#include <unordered_map>
 #include "features/hma_filter.h"
 #include "features/kernel_filter.h"
 #include "symbol_regime.h"
-#include "true_price/true_price_engine.h"
-#include <optional>
+namespace arb { class IExchange; }
 
-using arb::IExchange;
 class CrossVenueSignalEngine;
+class RegimeFilter;
 
 namespace mm_cfg {
+
+// ─── Тайминги (ms) ──────────────────────────────────────────────
+    constexpr uint64_t kBlockLogIntervalMs       = 30'000;
+    constexpr uint64_t kTrendCutCooldownMs       = 60'000;
+    constexpr uint64_t kToxicCloseBlockMs        = 300'000;
+    constexpr uint64_t kBlacklistBlockMs         = 3'600'000;
+    constexpr uint64_t kPositionRefreshMs        = 20'000;
+    constexpr uint64_t kRefreshAfterFillCooldownMs = 3'000;
+    constexpr uint64_t kBookStaleMs              = 10'000;
+    constexpr uint64_t kPendingCloseTimeoutMs    = 90'000;
+    constexpr uint64_t kPendingCloseRetryBlockMs = 60'000;
+    constexpr uint64_t kMomentumMinAgeMs         = 500;
+    constexpr uint64_t kMomentumNoFillResetMs    = 3'000;
+    constexpr uint64_t kMomentumCloseTimeoutMs   = 4'000;
+    constexpr uint64_t kMomentumTier2AgeMs       = 5'000;
+    constexpr uint64_t kMomentumTier5AgeMs       = 10'000;
+    constexpr uint64_t kMomentumTier15AgeMs      = 20'000;
+    constexpr uint64_t kMinReplaceIntervalMs     = 5'000;
+    constexpr uint64_t kVpinPauseDurationMs      = 15'000;
+    constexpr uint64_t kBaseMaxHoldMs            = 300'000;
+    constexpr uint64_t kToxicMaxHoldMs           = 5'000;
+    constexpr uint64_t kMidHistoryWindowMs       = 60'000;
+    constexpr uint64_t kSigmaEmaIntervalMs       = 1'000;
+    constexpr uint64_t kMomentumDriftWindowMs    = 200;
+    constexpr uint64_t kDriftWindowMs            = 60'000;
+    constexpr uint64_t kStaleQuoteCooldownMs     = 1'000;
+    constexpr uint64_t kObiEmaIntervalMs         = 500;
+    constexpr uint64_t kFastAdverseMinAgeMs      = 5'000;
+    constexpr uint64_t kFastAdverseMaxAgeMs      = 30'000;
+    constexpr uint64_t kUrgencyAgeCapMs          = 30'000;
+    constexpr uint64_t kDriftLogIntervalMs       = 30'000;
+
+// ─── Пороги / эпсилоны ──────────────────────────────────────────
+    constexpr double   kPosEpsilon              = 1e-9;
+    constexpr double   kToxicThresholdBps       = -5.0;
+    constexpr double   kDustNotionalUsd         = 5.5;
+    constexpr double   kMinNotionalUsd          = 5.5;
+    constexpr double   kMaxHoldTriggerUsd       = 5.0;
+    constexpr double   kUrgencyMinUsd           = 1.0;
+    constexpr double   kUrgencyMaxUsd           = 20.0;
+    constexpr double   kSoftExitQtyRatio        = 0.15;
+    constexpr double   kSoftExitPnlPct          = -0.005;
+    constexpr double   kFastAdversePnlBps       = -15.0;
+
+// ─── Спреад / bps ───────────────────────────────────────────────
+    constexpr double   kMaxCrossBps             = 8.0;
+    constexpr double   kMinBpsFromTop           = 0.5;
+    constexpr int      kMinTicksFromTop         = 1;
+    constexpr double   kMomentumSpreadGateBps   = 35.0;
+    constexpr double   kMomentumHawkesGate      = 5.0;
+    constexpr double   kMomentumMinSpreadTicks  = 2.0;
+    constexpr double   kMinTrendThresholdPct    = 0.0020;
+    constexpr double kAbsoluteMaxBps = 500.0;
+// ── Классификация реального спреда (пороги, bps) ──
+// ОДИН источник истины для порогов
+    constexpr double kSpreadClassUltraWideBps = 50.0;
+    constexpr double kSpreadClassWideBps      = 30.0;
+    constexpr double kSpreadClassMidBps       = 15.0;
+    constexpr double kSpreadClassTightBps     = 8.0;
+    constexpr double kSpreadClassVeryTightBps = 3.0;
+
+// ── min_spread для каждого класса ──
+    constexpr double kMinSpreadUltraWideBps = 40.0;   // > 50 bps
+    constexpr double kMinSpreadWideBps      = 30.0;   // 30-50
+    constexpr double kMinSpreadMidBps       = 20.0;   // 15-30
+    constexpr double kMinSpreadTightBps     = 12.0;   // 8-15
+    constexpr double kMinSpreadVeryTightBps =  6.0;   // 3-8
+    constexpr double kMinSpreadUltraTightBps = 2.0;   // < 3
+    constexpr double kSpreadClassUltraUltraTightBps = 1.0;   // < 1 bps
+    constexpr double kMinSpreadUltraUltraTightBps   = 1.0;   // котируем в 0.5 bps
+
+// ── Fee floor ──
+    constexpr double kMinSpreadFeeMultiplier = 2.0;
+    constexpr double kMinSpreadFeePremiumBps = 1.0;
+
+    struct SpreadClass {
+        double threshold_bps;
+        double min_spread_bps;
+    };
+
+    constexpr std::array<SpreadClass, 7> kSpreadTable = {{
+       { .threshold_bps=kSpreadClassUltraWideBps, .min_spread_bps=kMinSpreadUltraWideBps },
+       { .threshold_bps=kSpreadClassWideBps,      .min_spread_bps=kMinSpreadWideBps      },
+       { .threshold_bps=kSpreadClassMidBps,       .min_spread_bps=kMinSpreadMidBps       },
+       { .threshold_bps=kSpreadClassTightBps,     .min_spread_bps=kMinSpreadTightBps     },
+       { .threshold_bps=kSpreadClassVeryTightBps, .min_spread_bps=kMinSpreadVeryTightBps },
+       { .threshold_bps=kSpreadClassUltraUltraTightBps, .min_spread_bps=kMinSpreadUltraTightBps   },
+       { .threshold_bps=0.0,                            .min_spread_bps=kMinSpreadUltraUltraTightBps },
+    }};
+
+// ─── Skew / мультипликаторы ─────────────────────────────────────
+    constexpr double   kObiSkewMax              = 0.30;
+    constexpr double   kOfiSkewMax              = 0.15;
+    constexpr double   kHmaSkewMaxFactor        = 0.05;
+    constexpr double   kHmaSkewThresholdBps     = 0.5;
+    constexpr double   kHmaSkewScaleBps         = 30.0;
+    constexpr double   kMomentumMaxDriftPct     = 0.00005;
+    constexpr double   kQtyInventoryPenalty     = 0.7;
+    constexpr double   kToxicQtyMult            = 0.3;
+    constexpr double   kIlliquidQtyMult         = 0.5;
+    constexpr double   kToxicHalfSpreadMult     = 1.5;
+    constexpr double   kIlliquidHalfSpreadMult  = 2.0;
+    constexpr double   kToxicBlockRatio         = 0.30;
+    constexpr double   kPositionRiskBlockRatio  = 0.5;
+    constexpr double   kQtyRatioSoftExit        = 0.15;
+    constexpr double   kSkewUrgencyMult         = 1.5;
+
+// ─── OBI / OFI / VPIN ───────────────────────────────────────────
+    constexpr double   kObiEmaAlpha             = 0.3;
+    constexpr double   kObiEmaKeep              = 0.7;
+    constexpr double   kObiBlockThreshold       = 0.4;
+    constexpr double   kVpinMultThreshold       = 0.5;
+    constexpr double   kVpinMultSlope           = 2.0;
+    constexpr int      kVpinWindow              = 20;
+    constexpr int      kObiLevels               = 5;
+    constexpr int      kOfiSumLevels            = 100;
+
+// ─── Sigma / волатильность ─────────────────────────────────────
+    constexpr double   kSigmaEmaAlpha           = 0.05;
+    constexpr double   kStressVolRatioThreshold = 1.3;
+    constexpr double   kStressSpreadMultBase    = 1.5;
+    constexpr double   kSigmaRatioClampLo       = 0.5;
+    constexpr double   kSigmaRatioClampHi       = 3.0;
+
+// ─── Drift / stale ──────────────────────────────────────────────
+    constexpr double   kDriftThresholdMinBps    = 10.0;
+    constexpr double   kDriftThresholdSigmaMult = 1.5;
+    constexpr double   kStaleBidDistMinBps      = 10.0;
+    constexpr double   kStaleBidDistMaxBps      = 300.0;
+    constexpr double   kMoveThrTier1            = 2.0;
+    constexpr double   kMoveThrDefault          = 0.5;
+
+// ─── Дополнительные (для устранения остатков) ───────────────
+    constexpr double   kPctToBps                = 10'000.0;
+    constexpr double kTickRoundEpsilon          = 1e-9;
+
+// Инвентарь / действия
+    constexpr double   kMinInventoryUsdForAction   = 1.0;   // KILL, max-hold, urgency
+    constexpr double   kActionableInventoryUsd     = 5.0;   // TREND-cut, FAST_ADVERSE
+
+// Trend-cut
+    constexpr double   kTrendThresholdSpreadFactor = 0.3;
+    constexpr double   kMinTrendThresholdBps       = 20.0;
+
+// Inventory penalty
+    constexpr double   kInvPenaltyQuadFactor       = 0.5;
+
+// Side-bias half-spread
+    constexpr double   kSideBiasActivationRatio    = 0.05;
+    constexpr double   kSideBiasHalfSpreadSlope    = 0.5;
+
+// OFI clamp
+    constexpr double   kOfiNormClampAbs            = 3.0;
+
+// Tick-size discovery
+    constexpr double   kTickProbeMult              = 1.001;
+    constexpr double   kTickFallbackFraction       = 0.0001;
+
+// Gap from BBO
+    constexpr double   kMinGapBps                  = 1.0;
+
+// Momentum close replace
+    constexpr double   kMomentumCloseReplaceTicks  = 2.0;
+
+// Drift threshold
+    constexpr double   kDriftSigmaSeconds          = 60.0;
+
+// Toxic-markout filter
+    constexpr uint32_t kToxicMinMarkouts4h         = 20;
+    constexpr double   kToxicMinHitPct1s           = 20.0;
+
+// Momentum history
+    constexpr size_t   kMinHistoryForMomentum      = 3;
+
+    constexpr double kHalfTickFactor = 0.5;
+    constexpr double kOneTickFactor  = 1.0;
+    constexpr double kTwoTicksFactor = 2.0;
+
+    [[nodiscard]] static auto floorToTick(double p, double tick) noexcept -> double
+    {
+        return std::floor((p / tick) + kTickRoundEpsilon) * tick;
+    }
+
+    [[nodiscard]] static auto ceilToTick(double p, double tick) noexcept -> double
+    {
+        return std::ceil((p / tick) - kTickRoundEpsilon) * tick;
+    }
 
     struct RegimeTuning { double half_spread_mult = 1.0; double qty_mult = 1.0; };
 
@@ -40,24 +231,41 @@ namespace mm_cfg {
         }
     }
 
-} // namespace mm_cfg
+
+    inline auto mm_now_ms() -> uint64_t {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    inline auto make_reject_id(const std::string& side) -> std::string {
+        static std::atomic<uint64_t> seq{0};
+        return "REJ_" + std::to_string(mm_now_ms()) + "_" + side
+                   + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+    }
+
+}
 
 
 class MarketMakingStrategy : public std::enable_shared_from_this<MarketMakingStrategy> {
 public:
     void set_regime_snapshot(const mm::SymModeSnapshot& s) { regime_ = s; }
-    const mm::SymModeSnapshot& regime() const { return regime_; }
+    auto regime() const -> const mm::SymModeSnapshot& { return regime_; }
     void set_executor(net::any_io_executor exec) {
         exec_ = std::move(exec);
         has_exec_ = true;
     }
 
     void set_tp_engine(std::shared_ptr<tp::TruePriceEngine> e) { tp_engine_ = std::move(e); }
-    tp::TruePriceEngine* get_tp_engine() const { return tp_engine_.get(); }
+    auto get_tp_engine() const -> tp::TruePriceEngine* { return tp_engine_.get(); }
     void cancel_ask_on_through(double trade_price, const std::string& reason);
     void cancel_bid_on_through(double trade_price, const std::string& reason);
-    void cancel_ask_now(const std::string& reason);
-    void cancel_bid_now(const std::string& reason);
+
+    // Debug accessors (tests only)
+    std::map<std::string,bool> debug_pending_markouts_is_close() const {
+        std::map<std::string,bool> out;
+        for (const auto& [k, v] : pending_markouts_) out[k] = v.is_close;
+        return out;
+    }
 
     // ── Symbol regime (Sprint 3) ──
     struct FinalizedMarkout {
@@ -78,6 +286,7 @@ public:
         double   mk_5s_bps       = 0.0;
         double   mk_30s_bps      = 0.0;
         bool     finalized       = true;   // для совместимости с backtest main
+        bool     is_close        = false;
     };
     // ============================================================
     // Rolling σ estimator
@@ -92,23 +301,40 @@ public:
                 double ret = std::log(price / prices_.back().second);
                 if (std::isfinite(ret)) returns_.push_back(ret);
             }
-            prices_.push_back({ts_ms, price});
-            while (prices_.size()  > MAX_SAMPLES) prices_.pop_front();
-            while (returns_.size() > MAX_SAMPLES) returns_.pop_front();
+            prices_.emplace_back(ts_ms, price);
+            while (prices_.size()  > MAX_SAMPLES) {
+                prices_.pop_front();
+            }
+            while (returns_.size() > MAX_SAMPLES) {
+                returns_.pop_front();
+            }
         }
 
-        bool get_sigma_per_sqrt_sec(double& out) const {
-            if (returns_.size() < MIN_SAMPLES || prices_.size() < 2) return false;
+        auto get_sigma_per_sqrt_sec(double& out) const -> bool {
+            if (returns_.size() < MIN_SAMPLES || prices_.size() < 2) {
+                return false;
+            }
+
             double mean = 0.0;
-            for (double r : returns_) mean += r;
+            for (double r : returns_) {
+                mean += r;
+            }
+
             mean /= static_cast<double>(returns_.size());
             double var = 0.0;
-            for (double r : returns_) { double d = r - mean; var += d * d; }
+            for (double r : returns_) {
+                double d = r - mean; var += d * d;
+            }
             var /= static_cast<double>(returns_.size() - 1);
             uint64_t dt_ms = prices_.back().first - prices_.front().first;
-            if (dt_ms == 0) return false;
+            if (dt_ms == 0) {
+                return false;
+            }
             double avg_dt_sec = (dt_ms / 1000.0) / static_cast<double>(returns_.size());
-            if (avg_dt_sec <= 0) return false;
+            if (avg_dt_sec <= 0) {
+                return false;
+            }
+
             out = std::sqrt(var / avg_dt_sec);
             return std::isfinite(out) && out > 0;
         }
@@ -126,14 +352,14 @@ public:
     }
 
     struct PlaceContext {
-        double mid;
-        double best_bid;
-        double best_ask;
-        double half_spread;
-        double skew;
-        double sigma;
-        double q_ratio;
-        double inv_usd;
+        double mid {};
+        double best_bid {};
+        double best_ask {};
+        double half_spread {};
+        double skew {};
+        double sigma {};
+        double q_ratio {};
+        double inv_usd {};
         double cross_bps     = 0.0;
         double ret_500       = 0.0;
         double flow_b        = 0.0;
@@ -163,11 +389,11 @@ public:
         bool        is_valid;
     };
     // ── Ranking momentum ──
-    MomentumSignal compute_momentum_signal(uint64_t now) const;
+    auto compute_momentum_signal(uint64_t now) const -> MomentumSignal;
     void set_momentum_selected(bool sel) { momentum_selected_ = sel; }
-    bool is_momentum_enabled() const { return momentum_enabled_; }
-    const std::string& get_symbol() const { return symbol_; }
-    const std::string& get_venue() const { return is_bitunix_symbol_ ? "bitunix" : "bybit"; }
+    auto is_momentum_enabled() const -> bool { return momentum_enabled_; }
+    auto get_symbol() const -> const std::string& { return symbol_; }
+    auto get_venue() const -> std::string { return is_bitunix_symbol_ ? "bitunix" : "bybit"; }
 
     struct PlacedOrderInfo {
         double      price;
@@ -182,7 +408,7 @@ public:
 
     MarketMakingStrategy(OrderBook& orderbook,
                          ClusterEngine& cluster,
-                         IExchange& exchange,
+                         arb::IExchange& exchange,
                          std::string  symbol,
                          double base_spread_pct   = 0.002,
                          double order_qty_usd     = 15.0,
@@ -190,7 +416,7 @@ public:
 
     void tick();
     void set_db_connection(std::shared_ptr<pqxx::connection> conn) { db_conn_ = conn; }
-    double get_inventory_usd() const { return inventory_usd_; }
+    auto get_inventory_usd() const -> double { return inventory_usd_; }
 
     // Callback из poll_mm_fills. Если параметры переданы — используется точная цена/time
     void on_order_filled(const std::string& order_id,
@@ -199,6 +425,23 @@ public:
                          double fill_qty,
                          const std::string& side,
                          bool is_full_fill = true);   // ← NEW
+
+    auto get_inventory_qty() const -> double { return inventory_qty_; }
+
+    // ─────────────────────────────────────────────────────────
+    // Debug accessors (used by tests/test_sprint1.cpp).
+    // Unconditional — 6 inline one-liners, никакого влияния на prod.
+    // ─────────────────────────────────────────────────────────
+    void debug_set_bid(const std::string& oid, double px) {
+        bid_order_id_ = oid;
+        last_bid_p_   = px;
+    }
+    void debug_set_ask(const std::string& oid, double px) {
+        ask_order_id_ = oid;
+        last_ask_p_   = px;
+    }
+    const std::string& debug_bid_oid() const { return bid_order_id_; }
+    const std::string& debug_ask_oid() const { return ask_order_id_; }
 
     // ============================================================
     // Setters
@@ -217,11 +460,8 @@ public:
     void set_soft_exit_pnl_pct(double p)           { soft_exit_pnl_pct_ = p; }
     void set_use_adaptive(bool v)                  { use_adaptive_ = v; }
 
-    // Diagnostics
-    double get_last_sigma() const       { return last_sigma_; }
-    double get_last_half_spread() const { return last_half_spread_; }
-    double get_last_skew() const        { return last_skew_; }
-    const AdaptiveController::Params& get_adaptive_params() const { return adaptive_params_; }
+    auto get_last_half_spread() const -> double { return last_half_spread_; }
+    auto get_adaptive_params() const -> const AdaptiveController::Params& { return adaptive_params_; }
     void set_run_tag(const std::string& tag) { run_tag_ = tag; }
     void set_momentum_weight(double w) { momentum_weight_ = std::max(0.0, w); }
     void reset_vol_estimator() {
@@ -230,7 +470,7 @@ public:
         mid_history_.clear();
         last_trend_log_ms_ = 0;
     }
-    bool refresh_position();
+    auto refresh_position() -> bool;
     void on_trade_through_ask(double price, double size);
     void on_trade_through_bid(double price, double size);
 
@@ -243,42 +483,44 @@ public:
         vpin_resume_ = vpin_resume;
     }
 
-    double maker_fee_bps() const { return maker_fee_bps_; }
+    auto maker_fee_bps() const -> double { return maker_fee_bps_; }
     void set_maker_fee_bps(double v) { maker_fee_bps_ = v; }
 
     // Graceful shutdown: отменить ордера, закрыть позиции (для hot-disable)
     void shutdown_gracefully(const std::string& reason = "GRACEFUL_SHUTDOWN");
+    // true когда cleanup после shutdown_gracefully() полностью выполнен.
+    // Внешний loop должен поллить это перед io_context.stop().
+    bool is_shutdown_complete() const {
+        return shutdown_complete_.load(std::memory_order_acquire);
+    }
 
     // Публичный доступ к inventory для disable-логики
-    double inventory_usd() const { return inventory_usd_; }
+    auto inventory_usd() const -> double { return inventory_usd_; }
     void set_max_hold_sec(int sec) { max_hold_override_sec_ = std::max(0, sec); }
 
-    std::vector<FinalizedMarkout> drain_finalized_markouts();
-// public:
-    void set_momentum_tp(double tp_bps, uint64_t max_ms) {
-        momentum_tp_bps_ = tp_bps;
-        momentum_max_ms_ = max_ms;
-    }
+    auto drain_finalized_markouts() -> std::vector<FinalizedMarkout>;
 
     void set_momentum_mode(bool enabled, double qty_usd = 100.0) {
         momentum_enabled_ = enabled;
         momentum_qty_usd_ = qty_usd;
     }
-    std::shared_ptr<tp::TruePriceEngine> tp_engine_;
     void set_momentum_threshold(double thr_bps) { momentum_thr_ = thr_bps; }
-
-
+    void close_position_market(double best_bid, double best_ask,
+                               const std::string& reason = "HARD_CAP");
 private:
+
+
+    std::shared_ptr<tp::TruePriceEngine> tp_engine_;
 
     enum class QuoteSide { Bid, Ask };
 
     struct QuotePrices { double bid; double ask; };
 
-    [[nodiscard]] QuotePrices computeQuotePrices(
+    [[nodiscard]] auto computeQuotePrices(
             double micro, double bid_half, double ask_half,
             double skew, double momentum_skew, double obi_skew,
             double ofi_skew, double cross_skew,
-            double best_bid, double best_ask, double tick_size) const;
+            double best_bid, double best_ask, double tick_size) const -> QuotePrices;
 
     void maintainQuoteSide(QuoteSide side,
                            bool allow,
@@ -309,18 +551,20 @@ private:
         const char* ask_block_reason = "";
     };
 
-    [[nodiscard]] SideGates evaluateGates(const GateInputs& in);
+    [[nodiscard]] auto evaluateGates(const GateInputs& in) -> SideGates;
 
 
     bool     momentum_selected_ = false;
     HmaFilter    hma_fast_{8,  1000};   // 8 секунд, быстрый тренд
     HmaFilter    hma_slow_{32, 1000};   // 32 секунды, медленный тренд
     KernelFilter kernel_{120'000, 30'000};   // 2 мин окно, 30s bandwidth
-    double compute_hma_skew_bps() const;
+    auto compute_hma_skew_bps() const -> double;
     double hma_skew_bps_ = 0.0;
     uint64_t pending_close_first_attempt_ms_ = 0;
-    uint64_t now() const {
-        if (backtest_now_ms_ > 0) return backtest_now_ms_;
+    auto now() const -> uint64_t {
+        if (backtest_now_ms_ > 0) {
+            return backtest_now_ms_;
+        }
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
     }
@@ -342,7 +586,7 @@ private:
     uint64_t last_sigma_ema_ms_  = 0;
     OrderBook&      orderbook_;
     ClusterEngine&  cluster_;
-    IExchange& api_;
+    arb::IExchange& api_;
     std::string     symbol_;
     int consecutive_invalid_pos_ = 0;
     double base_spread_pct_;
@@ -350,7 +594,19 @@ private:
     double max_position_usd_;
     std::atomic<bool> pending_cancel_ask_{false};
     std::atomic<bool> pending_cancel_bid_{false};
-    // Инвентарь
+    // ─────────────────────────────────────────────────────────────
+    // Trigger-цены из WS thread. Хранятся как min (bid) / max (ask),
+    // чтобы tick() получил «худший» трейд за интервал.
+    // Sentinel — очень далеко от реальных цен.
+    // ─────────────────────────────────────────────────────────────
+    static constexpr double kNoPriceSentinel = 1e100;
+    std::atomic<double> pending_cancel_ask_trigger_{ -kNoPriceSentinel };
+    std::atomic<double> pending_cancel_bid_trigger_{  kNoPriceSentinel };
+
+    // Только tick() вызывает. Внутри — сетевой cancel + log + clear state.
+    void cancel_ask_now(const std::string& reason);
+    void cancel_bid_now(const std::string& reason);
+
     double      inventory_usd_ = 0.0;
     double      inventory_qty_ = 0.0;
     std::string inventory_side_;
@@ -360,6 +616,41 @@ private:
     std::string ask_order_id_;
 
     std::shared_ptr<pqxx::connection> db_conn_;
+
+    // ─────────────────────────────────────────────────────────────
+    // Deferred fills — единственный канал из ASIO fill-thread в tick-thread
+    // ─────────────────────────────────────────────────────────────
+    struct DeferredFill {
+        std::string order_id;
+        uint64_t    fill_ts_ms;
+        double      fill_price;
+        double      fill_qty;
+        std::string side;
+        bool        is_full_fill;
+    };
+    mutable std::mutex        deferred_fill_mtx_;
+    std::vector<DeferredFill> deferred_fills_;
+
+    // Timestamp последнего применённого fill (на tick-thread).
+    // refresh_position() пропускается если now - last_fill_processed_ms_
+    // < kRefreshAfterFillCooldownMs — API может быть ещё stale.
+    uint64_t last_fill_processed_ms_ = 0;
+
+    void process_deferred_fills(uint64_t now);
+    void apply_fill_internal(const std::string& order_id,
+                             uint64_t fill_ts_ms,
+                             double   fill_price,
+                             double   fill_qty,
+                             const std::string& side,
+                             bool     is_full_fill);
+
+    // ─────────────────────────────────────────────────────────────
+    // shutting_down_ — читается из handleEarlyExits (tick),
+    // пишется из shutdown_gracefully (может быть любая нить)
+    // ─────────────────────────────────────────────────────────────
+    std::atomic<bool> shutting_down_{false};
+    std::atomic<bool> shutdown_complete_{false};
+    void shutdown_do_work(const std::string& reason);
 
     // AS/GLFT параметры
     double gamma_                = 4.0;
@@ -410,9 +701,6 @@ private:
     bool     use_adaptive_      = true;
     uint64_t last_adverse_close_ms_ = 0;
     double      momentum_weight_ = 1.0;
-    // Внутренние методы
-    void close_position_market(double best_bid, double best_ask,
-                               const std::string& reason = "HARD_CAP");
     void run_adaptive_update(uint64_t now_ms);
     void prune_placed_orders(uint64_t now_ms);
     uint64_t last_bid_place_ms_ = 0;
@@ -431,6 +719,7 @@ private:
         double      fill_price = 0.0;
         double      fair_price_at_fill = 0.0;
         uint64_t    fill_time_ms = 0;
+        bool        is_close = false;
         std::array<double, 7> mids{0.0, 0.0, 0.0, 0.0, 0.0};
         std::array<bool,   7> recorded{false,false,false,false,false};
         bool finalized = false;
@@ -446,7 +735,6 @@ private:
 // ── Helpers ──
     void update_pending_markouts(uint64_t now);
     void persist_markout(const PendingMarkout& m);
-    bool shutting_down_ = false;
     bool     momentum_enabled_              = false;
     bool     momentum_active_               = false;
     double   momentum_skew_                 = 0.0;
@@ -483,22 +771,22 @@ private:
     void   processPendingClose(uint64_t now, double best_bid, double best_ask);
 
     // Возвращает true, если tick «съеден» (нужно выйти из tick()).
-    bool   handleMomentumMode(uint64_t now, double mid,
+    auto   handleMomentumMode(uint64_t now, double mid,
                               double best_bid, double best_ask,
-                              double tick_size);
-    bool   handleMaxHold(uint64_t now, double mid,
-                         double best_bid, double best_ask);
-    bool   handleTrendCut(uint64_t now, double mid,
-                          double best_bid, double best_ask);
+                              double tick_size) -> bool;
+    auto   handleMaxHold(uint64_t now, double mid,
+                         double best_bid, double best_ask) -> bool;
+    bool handleTrendCut(uint64_t now, double mid, double best_bid, double best_ask,
+                        double sigma);
 
     // ─── Вычисления ──────────────────────────────────────────
-    double computeMomentumSkew(uint64_t now, double mid) const;
-    double computeTimeUrgency(uint64_t now) const;
-    double computeDrift60sBps(uint64_t now, double mid) const;
+    auto computeMomentumSkew(uint64_t now, double mid) const -> double;
+    auto computeTimeUrgency(uint64_t now) const -> double;
+    auto computeDrift60sBps(uint64_t now, double mid) const -> double;
 
     // Возвращает mid из истории, ближайший к now-window_ms;
     // если не нашли — самый старый; если история пуста — fallback.
-    double findMidAgo(uint64_t now, uint64_t window_ms, double fallback) const;
+    auto findMidAgo(uint64_t now, uint64_t window_ms, double fallback) const -> double;
 
     void   updateSigmaEma(uint64_t now, double sigma);
     void   pushMidHistory(uint64_t now, double mid);
@@ -561,34 +849,34 @@ private:
 
     using RegimeTuning = mm_cfg::RegimeTuning;
     // ─── Методы ──────────────────────────────────────────────
-    bool handleToxicFillCheck(uint64_t now, double mid,
-                              double best_bid, double best_ask);
-    bool handleVpinPause(uint64_t now);
+    auto handleToxicFillCheck(uint64_t now, double mid,
+                              double best_bid, double best_ask) -> bool;
+    auto handleVpinPause(uint64_t now) -> bool;
 
-    Signals computeSignals(uint64_t now, double mid);
-    VolState computeVolatility(uint64_t now);
-    SpreadState computeSpreadParams(double mid, double best_bid, double best_ask,
-                                    double sigma, const VolState& vol);
-    SideHalves computeSideHalves(double half_spread, double q_ratio,
+    auto computeSignals(uint64_t now, double mid) -> Signals;
+    auto computeVolatility(uint64_t now) -> VolState;
+    auto computeSpreadParams(double mid, double best_bid, double best_ask,
+                                    double sigma, const VolState& vol) -> SpreadState;
+    auto computeSideHalves(double half_spread, double q_ratio,
                                  double hma_skew_bps,
                                  const RegimeTuning& bid_tuning,
-                                 const RegimeTuning& ask_tuning) const;
-    CrossSkew computeCrossSkew(uint64_t now, double mid);
+                                 const RegimeTuning& ask_tuning) const -> SideHalves;
+    auto computeCrossSkew(uint64_t now, double mid) -> CrossSkew;
 
-    Qtys computeQuantities(double mid, double q_ratio, double eff_qty_usd,
+    auto computeQuantities(double mid, double q_ratio, double eff_qty_usd,
                            const RegimeTuning& bid_tuning,
-                           const RegimeTuning& ask_tuning);
-    double clampQtyToMinNotional(double q, double mid, mm::SymMode mode) const;
+                           const RegimeTuning& ask_tuning) -> Qtys;
+    auto clampQtyToMinNotional(double q, double mid, mm::SymMode mode) const -> double;
 
-    ReplaceFlags computeReplaceFlags(uint64_t now,
+    auto computeReplaceFlags(uint64_t now,
                                      double bid_price, double ask_price,
                                      double bid_half, double ask_half,
-                                     double tick_size) const;
+                                     double tick_size) const -> ReplaceFlags;
 
-    PlaceContext buildPlaceContext(double mid, double best_bid, double best_ask,
+    auto buildPlaceContext(double mid, double best_bid, double best_ask,
                                    double half_spread, double skew, double sigma,
                                    double q_ratio, double hma_skew_bps,
-                                   double tp_shadow_bps, uint64_t now) const;
+                                   double tp_shadow_bps, uint64_t now) const -> PlaceContext;
 
     struct MarketSnapshot {
         double mid;
@@ -597,20 +885,20 @@ private:
         double micro;
     };
 
-    bool                            handleEarlyExits(uint64_t now) const;
-    std::optional<MarketSnapshot>   readMarketSnapshot(uint64_t now) const;
-    bool                            refreshPositionIfDue(uint64_t now);
-    double                          getTickSize(double mid) const;
-    bool                            handleRegimeFilter();
-    bool                            handleKillSwitch(double best_bid, double best_ask);
-    bool                            handleHardCap(double best_bid, double best_ask) const;
-    bool                            handleRiskExits(uint64_t now, double q_ratio,
-                                                    double best_bid, double best_ask);
-    double                          computeInventorySkew(uint64_t now, double half_spread,
-                                                         double sigma_ratio, double q_ratio) const;
+    auto                            handleEarlyExits(uint64_t now) const -> bool;
+    auto   readMarketSnapshot(uint64_t now) const -> std::optional<MarketSnapshot>;
+    auto                            refreshPositionIfDue(uint64_t now) -> bool;
+    auto                            getTickSize(double mid) const -> double;
+    auto                            handleRegimeFilter() -> bool;
+    auto                            handleKillSwitch(double best_bid, double best_ask) -> bool;
+    auto                            handleHardCap(double best_bid, double best_ask) const -> bool;
+    auto                            handleRiskExits(uint64_t now, double q_ratio,
+                                                    double best_bid, double best_ask) -> bool;
+    auto                          computeInventorySkew(uint64_t now, double half_spread,
+                                                         double sigma_ratio, double q_ratio) const -> double;
     void                            updateObiEma(uint64_t now, double obi);
 
     struct BlockRatios { double bid = 0.0; double ask = 0.0; };
-    [[nodiscard]] BlockRatios computeBlockRatios() const noexcept;
+    [[nodiscard]] auto computeBlockRatios() const noexcept -> BlockRatios;
 
 };

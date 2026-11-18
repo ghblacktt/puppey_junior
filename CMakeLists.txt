@@ -85,6 +85,9 @@ add_executable(bybit_client
         src/binance/binance_public_ws.cpp
         src/true_price/true_price_engine.h
         src/symbol_regime.cpp
+        src/tests/test_sprint1.cpp
+        src/fill_model.cpp
+        src/local_orderbook.cpp
 )
 
 target_include_directories(bybit_client PRIVATE
@@ -194,3 +197,14 @@ if(APPLE)
             -Wl,-no_warn_duplicate_libraries
     )
 endif()
+
+# ─── Sprint 1 verification ───
+add_executable(test_sprint1 src/tests/test_sprint1.cpp
+        src/market_making_strategy.cpp
+        # ... остальные .cpp которые нужны для MarketMakingStrategy ...
+        # если OrderBook/ClusterEngine в отдельных .cpp — добавь их сюда
+)
+target_include_directories(test_sprint1 PRIVATE src)
+target_link_libraries(test_sprint1 PRIVATE
+        # те же библиотеки что и у bybit_client — pqxx, boost, simdjson, ...
+)

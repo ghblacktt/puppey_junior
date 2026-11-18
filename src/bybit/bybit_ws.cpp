@@ -40,7 +40,8 @@ BybitWSClient::BybitWSClient(net::io_context& ioc, ssl::context& ctx,
           pos_manage_timer_(net::make_strand(ioc)),
           reconnect_timer_(net::make_strand(ioc)),
           subscribe_delay_timer_(net::make_strand(ioc)),
-          regime_update_timer_(net::make_strand(ioc))
+          regime_update_timer_(net::make_strand(ioc)),
+          registry_sync_timer_(ioc)
 {
     for (const auto& symbol : symbols) {
         tickers_[symbol] = std::make_unique<TickerState>(symbol, api_, 1);
@@ -107,7 +108,7 @@ void BybitWSClient::init_mm_strategies(IExchange& exchange) {
     for (const auto& symbol : symbols_) {
         auto it = tickers_.find(symbol);
         if (it == tickers_.end()) continue;
-        if (!mm_registry_ || !mm_registry_->is_enabled(symbol)) continue;
+        if (!mm_registry_ || !mm_registry_->is_whitelisted(symbol)) continue;
 
         try {
             size_t before = mm_strategies_.size();
@@ -131,40 +132,50 @@ void BybitWSClient::init_mm_strategies(IExchange& exchange) {
 }
 
 void BybitWSClient::create_mm_for_symbol(const std::string& symbol) {
-    if (!exchange_) return;
+    if (!exchange_) {
+        std::cerr << "[MM] " << symbol << " skipped: exchange_ null\n";
+        return;
+    }
     auto it = tickers_.find(symbol);
-    if (it == tickers_.end()) return;
-    if (mm_strategies_.count(symbol) > 0) return;
+    if (it == tickers_.end()) {
+        std::cerr << "[MM] " << symbol << " skipped: not in tickers_ (WS не подписан)\n";
+        return;
+    }
+    if (mm_strategies_.count(symbol) > 0) return;   // уже создан — ok, не warn
 
     double px_hint = it->second->orderbook.get_mid_price();
-    if (px_hint <= 0.0) return;
+    if (px_hint <= 0.0) {
+        std::cerr << "[MM] " << symbol << " skipped: no book price (WS не прислал data)\n";
+        return;
+    }
 
     // ═══ Illiquid filter ═══
     {
-        double bb = it->second->orderbook.get_best_bid();
-        double ba = it->second->orderbook.get_best_ask();
-        if (bb <= 0 || ba <= bb) {
+        double bb_check = it->second->orderbook.get_best_bid();
+        double ba_check = it->second->orderbook.get_best_ask();
+        if (bb_check <= 0 || ba_check <= bb_check) {
             std::cout << "[MM] " << symbol << " skipped (bad book)\n";
             return;
         }
-        double mid_hint = (bb + ba) / 2.0;
-        double spread_bps = (ba - bb) / mid_hint * 10000.0;
-        double bid_depth_usd = bb * it->second->orderbook.get_best_bid_size();
-        double ask_depth_usd = ba * it->second->orderbook.get_best_ask_size();
+        double mid_check = (bb_check + ba_check) / 2.0;
+        double mid_hint = (bb_check + ba_check) / 2.0;
+        double spread_bps = (ba_check - bb_check) / mid_hint * 10000.0;
+        double bid_depth_usd = bb_check * it->second->orderbook.get_best_bid_size();
+        double ask_depth_usd = ba_check * it->second->orderbook.get_best_ask_size();
         double min_depth_usd = std::min(bid_depth_usd, ask_depth_usd);
-
         if (spread_bps > 80.0) {
             std::cout << "[MM] " << symbol << " skipped (spread="
                       << std::fixed << std::setprecision(1) << spread_bps
                       << "bps > 80)\n" << std::defaultfloat;
             return;
         }
-        if (min_depth_usd < 2000.0) {
+        if (min_depth_usd < 15.0) {
             std::cout << "[MM] " << symbol << " skipped (depth=$"
                       << std::fixed << std::setprecision(0) << min_depth_usd
-                      << " < $2000)\n" << std::defaultfloat;
+                      << " < $15)\n" << std::defaultfloat;
             return;
         }
+
     }
 
     MmGlobalConfig g;
@@ -619,6 +630,7 @@ BybitWSClient::~BybitWSClient() {
     if (trade_ws_) trade_ws_->stop();
     if (private_ws_) private_ws_->stop();
     regime_update_timer_.cancel();
+    registry_sync_timer_.cancel();
 }
 
 void BybitWSClient::create_websocket() {
@@ -715,6 +727,21 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
     simdjson::dom::parser parser;
     simdjson::dom::element doc;
     if (parser.parse(json_buffer_.data(), size, size).get(doc) != simdjson::SUCCESS) return;
+    bool success_val;
+    if (doc["success"].get_bool().get(success_val) == simdjson::SUCCESS) {
+        if (!success_val) {
+            std::string_view ret_msg;
+            std::string_view req_id;
+            doc["ret_msg"].get_string().get(ret_msg);
+            doc["req_id"].get_string().get(req_id);
+            std::cerr << "[WS-SUB-FAIL] req_id=" << req_id
+                      << " ret_msg=" << ret_msg << "\n";
+            // ═══ важно: ret_msg содержит invalid symbols ═══
+            // Bybit возвращает "Invalid symbol : XXXUSDT,YYYUSDT"
+            // — можно распарсить и исключить из будущих подписок
+        }
+        return;   // не пытаемся парсить как market data
+    }
 
     std::string_view topic;
     if (doc["topic"].get_string().get(topic) != simdjson::SUCCESS) return;
@@ -848,7 +875,10 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                         if ( is_buyer_maker && price < bbo_bid) is_through = true;
                     }
 
-                    // ═══ 1. СНАЧАЛА MM — синхронно отменяет заявку, через которую прошёл трейд ═══
+                    // ═══ 1. MM: ставит pending-cancel флаг ═══
+//    Реальный cancel уйдёт из следующего tick (на tick-thread).
+//    До Sprint 2 здесь был синхронный cancel — он race'ил с tick-thread
+//    и приводил к пропущенным fills в Paper (см. ниже).
                     auto mm_it = mm_strategies_.find(symbol);
                     if (mm_it != mm_strategies_.end() && mm_it->second) {
                         auto* tp = mm_it->second->get_tp_engine();
@@ -874,7 +904,11 @@ void BybitWSClient::process_message(const char* data, std::size_t size) {
                         else                 mm_it->second->on_trade_through_bid(price, sz);
                     }
 
-                    // ═══ 2. ПОТОМ paper exchange — заявка уже Cancelled, fill не будет ═══
+// ═══ 2. Paper: fill применяется ДО cancel'а ═══
+//    Если трейд прошёл насквозь нашего ask — FillModel заполнит нас по
+//    нашему price (hit_through=fill). Остаток qty (если partial) отменится
+//    на следующем tick. Это корректная симуляция реального exchange:
+//    через-трейд = нас снепнули, потом мы отдёрнули остаток.
                     if (paper_exchange_) {
                         paper_exchange_->on_trade(symbol, price, sz, is_buyer_maker);
                     }
@@ -906,7 +940,7 @@ auto BybitWSClient::get_current_price(const std::string& symbol) -> double {
 }
 
 void BybitWSClient::subscribe_topics() {
-    const size_t batch_size = 10;
+    const size_t batch_size = 5;
     size_t total_batches = (symbols_.size() + batch_size - 1) / batch_size;
     send_subscribe_batch(0, batch_size, 1, total_batches);
 }
@@ -1478,6 +1512,81 @@ void BybitWSClient::scan_momentum_candidates() {
                       << std::defaultfloat << "\n";
         }
     }
+}
+
+void BybitWSClient::start_registry_sync() {
+    registry_sync_timer_.expires_after(std::chrono::seconds(30));
+    registry_sync_timer_.async_wait([this](beast::error_code ec) {
+        if (ec) return;
+
+        if (!mm_registry_ || !mm_initialized_.load()) {
+            start_registry_sync();
+            return;
+        }
+
+        try {
+            // 1. Reload из PG
+            mm_registry_->reload();
+
+            // 2. Добавить новые
+            auto enabled = mm_registry_->enabled_symbols();
+            for (const auto& sym : enabled) {
+                if (mm_strategies_.count(sym) == 0) {
+                    // Проверка: стакан есть?
+                    if (tickers_.find(sym) == tickers_.end()) continue;
+                    auto it = tickers_.find(sym);
+                    if (it->second->orderbook.get_mid_price() <= 0) continue;
+
+                    try {
+                        create_mm_for_symbol(sym);
+                        if (mm_strategies_.count(sym) > 0) {
+                            std::cout << "[SYNC] + NEW: " << sym << "\n";
+                        }
+                    } catch (const std::exception& e) {
+                        std::cerr << "[SYNC] " << sym
+                                  << " create failed: " << e.what() << "\n";
+                    }
+                }
+            }
+
+            // 3. Убрать отключённые
+            std::vector<std::string> to_remove;
+            for (auto& [sym, mm] : mm_strategies_) {
+                if (!mm_registry_->is_enabled(sym)) {
+                    to_remove.push_back(sym);
+                }
+            }
+            for (const auto& sym : to_remove) {
+                auto it = mm_strategies_.find(sym);
+                if (it == mm_strategies_.end()) continue;
+
+                try {
+                    auto mm = it->second;
+
+                    auto ticker_it = tickers_.find(sym);
+                    if (ticker_it != tickers_.end()) {
+                        double bb = ticker_it->second->orderbook.get_best_bid();
+                        double ba = ticker_it->second->orderbook.get_best_ask();
+
+                        // ═══ FIX: get_inventory_usd() вместо get_inventory_qty() ═══
+                        if (std::abs(mm->get_inventory_usd()) > 1e-9 && bb > 0 && ba > 0) {
+                            mm->close_position_market(bb, ba, "DISABLED");
+                        }
+                    }
+
+                    mm->shutdown_gracefully();
+                    mm_strategies_.erase(sym);
+                    std::cout << "[SYNC] - DISABLED: " << sym << "\n";
+                } catch (const std::exception& e) {
+                    std::cerr << "[SYNC] " << sym << " remove failed: " << e.what() << "\n";
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[SYNC] reload failed: " << e.what() << "\n";
+        }
+
+        start_registry_sync();
+    });
 }
 
 bool BybitWSClient::has_mm(const std::string& symbol) const {
