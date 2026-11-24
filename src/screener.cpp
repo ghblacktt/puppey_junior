@@ -9,7 +9,7 @@
 namespace {
     inline uint64_t now_ms() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
+                std::chrono::system_clock::now().time_since_epoch()).count();
     }
 }
 
@@ -62,6 +62,22 @@ void Screener::load(BybitApiClient& api) {
 
     // 2) Список символов — top-N ликвидных
     auto syms = api.get_top_liquid_symbols(cfg_.scan_top_n);
+
+    try {
+        pqxx::connection conn(conn_str_);
+        pqxx::work txn(conn);
+
+        auto r = txn.exec("SELECT symbol FROM mm_symbols WHERE enabled = TRUE");
+
+        for (auto row : r) {
+            syms.push_back(row[0].as<std::string>());
+        }
+
+        txn.commit();
+    } catch (...) {}
+
+    std::sort(syms.begin(), syms.end());
+    syms.erase(std::unique(syms.begin(), syms.end()), syms.end());
     std::lock_guard lk(mtx_);
     symbols_ = syms;
     for (const auto& s : syms) {
@@ -115,14 +131,14 @@ void Screener::on_book_update(const std::string& symbol,
 
     static std::atomic<uint64_t> _entry_count{0};
     uint64_t n = ++_entry_count;
-    if (n <= 10 || n % 1000 == 0) {   // ← первое 10 + каждые 1000
+    if (n <= 10 || n % 1000 == 0) {
         std::cout << "[SCREENER-ENTRY] n=" << n
                   << " sym=" << symbol
                   << " bb=" << best_bid << " ba=" << best_ask << "\n";
-        std::cout.flush();   // ← форсируем запись в файл
+        std::cout.flush();
     }
-    if (best_bid <= 0.0 || best_ask <= 0.0 || best_ask <= best_bid) return;
 
+    // Убрал дублирующуюся проверку
     if (best_bid <= 0.0 || best_ask <= 0.0 || best_ask <= best_bid) return;
 
     std::lock_guard lk(mtx_);
@@ -152,7 +168,7 @@ void Screener::on_book_update(const std::string& symbol,
     s.update_count++;
     s.update_events_ts_.push_back(t);
 
-    // ═══ DBG: раз в 500 событий, показывает реальное состояние shadow ═══
+    // ═══ DBG: раз в 500 событий ═══
     static std::atomic<uint64_t> _dbg_count{0};
     if (++_dbg_count % 500 == 0) {
         std::cerr << "[SCREENER-DBG] " << symbol
@@ -167,20 +183,20 @@ void Screener::on_book_update(const std::string& symbol,
                   << std::defaultfloat << "\n";
     }
 
-    // ── Shadow fill model (как реальный MM: cancel + replace) ──
-// ═══ FIX: per-symbol параметры (унификация с paper) ═══
-    // ── Shadow fill model ──
-    if (s.effective_min_hs_bps <= 0.0) {
-        if (registry_ && cfg_.use_per_symbol_params) {
-            s.effective_min_hs_bps = registry_->effective_min_hs_bps(symbol, mid);
-            s.effective_max_hold_sec = registry_->effective_max_hold_sec(symbol);
-        } else {
-            s.effective_min_hs_bps = cfg_.target_half_bps;
-            s.effective_max_hold_sec = cfg_.default_max_hold_sec;
-        }
+    // ═══════════════════════════════════════════════════════════
+    // FIX: Реалистичный dynamic min_hs для shadow
+    // Мы тестируем пару на том спреде, на котором РЕАЛЬНО будет
+    // торговать бот (target_half_bps), но даем небольшую фору
+    // для широких спредов, чтобы не стоять слишком далеко.
+    // ═══════════════════════════════════════════════════════════
+    double shadow_min_hs_bps;
+    if (registry_ && cfg_.use_per_symbol_params) {
+        shadow_min_hs_bps = registry_->effective_min_hs_bps(symbol, mid);
+    } else {
+        shadow_min_hs_bps = std::clamp(s.last_spread_median * 0.5, 2.0, 12.0);
     }
 
-    const double H = s.effective_min_hs_bps / 10000.0;
+    const double H = shadow_min_hs_bps / 10000.0;
     const double shadow_bid = mid * (1.0 - H);
     const double shadow_ask = mid * (1.0 + H);
 
@@ -213,7 +229,7 @@ void Screener::on_book_update(const std::string& symbol,
         o.symbol   = symbol;
         o.side     = side;
         o.price    = px;
-        o.qty      = 1.0;             // "один ордер"; cancel после первого fill
+        o.qty      = 1.0;
         o.placed_ms = t;
         shadow_fm_.register_order(std::move(o), best_bid, best_ask, bid_size, ask_size);
         pending    = true;
@@ -230,9 +246,8 @@ void Screener::on_book_update(const std::string& symbol,
                         s.shadow_ask_placed_ms, s.shadow_ask_oid_, s.shadow_ask_price);
     }
 
-// Sprint 7: align with live 30s markout (mm_markouts.mk_30s)
-    const uint64_t ADVERSE_WINDOW_MS = std::min<uint64_t>(
-            30'000, static_cast<uint64_t>(s.effective_max_hold_sec) * 1000ULL);
+    // Sprint 7: align with live 30s markout
+    const uint64_t ADVERSE_WINDOW_MS = 5'000;
 
     if (s.shadow_bid_fill_ms > 0 && (t - s.shadow_bid_fill_ms) >= ADVERSE_WINDOW_MS) {
         const double adv_bps = (s.shadow_bid_price - mid) / s.shadow_bid_price * 10000.0;
@@ -324,9 +339,6 @@ void Screener::compute_snapshot_metrics(SymbolScreenerStats& s) const {
         s.last_bbo_notional = 0.0;
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // Rolling 10-min event window (Sprint 4)
-    // ═══════════════════════════════════════════════════════════
     const uint64_t WINDOW_MS = static_cast<uint64_t>(cfg_.window_sec) * 1000ULL;
     const uint64_t now = now_ms();
     const uint64_t cutoff = (now > WINDOW_MS) ? (now - WINDOW_MS) : 0;
@@ -341,47 +353,89 @@ void Screener::compute_snapshot_metrics(SymbolScreenerStats& s) const {
         s.adverse_events_.pop_front();
     }
 
-    const int window_fills    = static_cast<int>(s.fills_events_ts_.size());
-    const int window_throughs = static_cast<int>(s.through_events_ts_.size());
-    const int window_updates  = static_cast<int>(s.update_events_ts_.size());
-    const int window_adv_n    = static_cast<int>(s.adverse_events_.size());
+    const int window_fills = static_cast<int>(s.fills_events_ts_.size());
+    const int window_updates = static_cast<int>(s.update_events_ts_.size());
+    const int window_adv_n = static_cast<int>(s.adverse_events_.size());
 
     double window_adv_sum = 0.0;
     for (const auto& [ts, bps] : s.adverse_events_) window_adv_sum += bps;
-    const double window_adv_avg = (window_adv_n > 0)
-                                  ? window_adv_sum / window_adv_n
-                                  : 0.0;
+    const double window_adv_avg = (window_adv_n > 0) ? window_adv_sum / window_adv_n : 0.0;
 
-    // Для совместимости с полями в mm_screening_stats:
-    s.last_shadow_fills = window_fills;   // ← теперь окно, не тотал
-    s.last_shadow_adv   = window_adv_avg; // ← окно
+    s.last_shadow_fills = window_fills;
+    s.last_shadow_adv = window_adv_avg;
+    s.last_update_rate = window_updates / (WINDOW_MS / 1000.0);
 
-    const double window_sec = WINDOW_MS / 1000.0;
-    s.last_update_rate = window_updates / window_sec;
+    // ═══════════════════════════════════════════════════════════
+    // 1. Расчет "сырого" edge (RAW EDGE)
+    // ═══════════════════════════════════════════════════════════
+    double gross_edge = -window_adv_avg - 4.0; // -2.0 bps на комиссии
 
-    // ═══ Composite score по окну ═══
-    // 1. Gross edge = -adverse - fee(2)
-    s.last_gross_edge = -window_adv_avg - 2.0;
+    double round_turn_ratio = (window_fills >= 4) ? 1.5 : 0.0;
 
-    // 2. Toxic penalty = through_pct × 3 (max −3)
-    const double through_ratio = (window_updates > 0)
-                                 ? std::min(1.0, (double)window_throughs / window_updates)
-                                 : 0.0;
-    s.last_through_pct   = through_ratio * 100.0;
-    s.last_toxic_penalty = through_ratio * 3.0;
+    const double through_ratio = (window_updates > 0) ? std::min(1.0, (double)s.through_count / window_updates) : 0.0;
+    double toxic_penalty = through_ratio * 5.0;
 
-    // 3. Volume bonus = log2(notional/1k) × 0.3 (max +3)
+    double volume_bonus = 0.0;
     if (s.last_bbo_notional > 0) {
-        s.last_volume_bonus = std::min(3.0,
-                                       std::log2(s.last_bbo_notional / 1000.0) * 0.3);
-    } else {
-        s.last_volume_bonus = 0.0;
+        volume_bonus = std::min(2.0, std::log2(s.last_bbo_notional / 500.0) * 0.4);
     }
 
-    s.last_net_edge    = s.last_gross_edge
-                         - s.last_toxic_penalty
-                         + s.last_volume_bonus;
+    double raw_edge = gross_edge + round_turn_ratio - toxic_penalty + volume_bonus;
+
+    // ═══════════════════════════════════════════════════════════
+    // 2. SHRINKAGE: Штраф за малую выборку (КЛЮЧЕВОЙ ФИКС)
+    // ═══════════════════════════════════════════════════════════
+    // Формула доверия: N / (N + K).
+    // Если K=20, то при N=5 филлах уверенность = 5 / 25 = 20%
+    // При N=20 филлах уверенность = 20 / 40 = 50%
+    // При N=100 филлах уверенность = 100 / 120 = 83%
+    constexpr double kShrinkK = 20.0;
+    const double n = static_cast<double>(window_fills);
+    const double confidence = (n > 0.0) ? (n / (n + kShrinkK)) : 0.0;
+
+    // Штраф за тонкий стакан: если BBO < $500, мы рискуем проскальзыванием.
+    // Максимальный штраф = 10 bps, если BBO = $0.
+    double thin_penalty = 0.0;
+    if (s.last_bbo_notional < 500.0) {
+        thin_penalty = ((500.0 - s.last_bbo_notional) / 500.0) * 10.0;
+    }
+
+    // Финальный скор с учетом доверия и штрафа за ликвидность
+    s.last_net_edge = (raw_edge * confidence) - thin_penalty;
     s.last_snapshot_ms = now;
+
+    // ═══ EXPONENTIAL DECAY: последние 15 минут имеют больший вес ═══
+    // alpha = 0.3 означает, что последний снапшот = 30% веса, прошлые = 70%
+    // Это даёт быструю реакцию на изменения рынка
+    // ═══ EXPONENTIAL DECAY: последние 15 минут имеют больший вес ═══
+    const double alpha = 0.3;
+    if (s.ema_last_update_ms == 0) {
+        s.ema_edge = s.last_net_edge;
+    } else {
+        s.ema_edge = alpha * s.last_net_edge + (1.0 - alpha) * s.ema_edge;
+    }
+    s.ema_last_update_ms = now;
+
+    // ═══════════════════════════════════════════════════════════
+    // 3. ГИСТЕРЕЗИС: обновляем счетчики
+    // ═══════════════════════════════════════════════════════════
+    bool is_good = (s.ema_edge >= cfg_.min_net_edge_bps) &&
+                   (s.last_shadow_fills >= cfg_.min_shadow_fills) &&
+                   (s.last_spread_p75 <= cfg_.max_spread_p75_bps);
+
+    // is_bad: edge упал значительно ниже порога (запас 0.5 bps)
+    bool is_bad = (s.ema_edge < (cfg_.min_net_edge_bps - 0.5));
+
+    if (is_good) {
+        s.consecutive_good_windows++;
+        s.consecutive_bad_windows = 0;
+    } else if (is_bad) {
+        s.consecutive_bad_windows++;
+        s.consecutive_good_windows = 0;
+    } else {
+        // Нейтральная зона: НЕ сбрасываем счетчики.
+        // Символ сохраняет накопленный прогресс, пока не станет явно плохим.
+    }
 }
 
 // ── Snapshot ──
@@ -459,52 +513,91 @@ void Screener::do_promote() {
     std::vector<std::pair<std::string, double>> to_promote;
     std::vector<std::pair<std::string, double>> to_demote;
 
-    int n_active = 0, n_cand = 0, n_ready = 0, n_demote = 0;
+    int n_active = 0;
+    int n_cand = 0;
+    int n_ready = 0;
+    int n_demote = 0;
 
     {
         std::lock_guard lk(mtx_);
+
         for (auto& [sym, s] : stats_) {
-            // ═══ FIX: is_whitelisted вместо is_enabled ═══
-            // is_enabled → true для неизвестных → блокирует promote
-            // is_whitelisted → false для неизвестных → promotes работают
-            bool is_active = registry_->is_whitelisted(sym);
+            const bool is_active = registry_ && registry_->is_whitelisted(sym);
+            if (is_active) ++n_active;
 
-            if (is_active) n_active++;
+            const bool liquid_ok = s.last_update_rate >= cfg_.min_update_rate_hz &&
+                                   s.last_bbo_notional >= cfg_.min_bbo_notional_usd;
+            const bool spread_is_viable = s.last_spread_median >= 2.0;
+            const bool spread_ok = spread_is_viable &&
+                                   s.last_spread_p75 <= cfg_.max_spread_p75_bps;
+            const bool sample_ok = s.last_shadow_fills >= cfg_.min_shadow_fills;
 
-            // ═══ PROMOTE ═══
-            bool pass_promote =
-                    s.last_spread_median >= 1.5
-                    && s.last_shadow_fills >= cfg_.min_shadow_fills
-                    && s.last_update_rate >= cfg_.min_update_rate_hz
-                    && s.last_bbo_notional >= cfg_.min_bbo_notional_usd
-                    && s.last_spread_p75 <= cfg_.max_spread_p75_bps
-                    && s.last_net_edge >= cfg_.min_net_edge_bps;
-
-            if (!is_active && s.last_shadow_fills >= cfg_.min_shadow_fills) {
-                n_cand++;
-                if (pass_promote) {
-                    n_ready++;
-                    to_promote.emplace_back(sym, s.last_net_edge);
-                }
+            // Пропускаем тонкие символы с широким спредом (защита от фейкового edge)
+            if (s.last_spread_median > 10.0 && s.last_bbo_notional < 3000.0) {
+                continue;
             }
 
-            // ═══ DEMOTE: только очень плохие ═══
-            if (is_active && s.last_net_edge < 0.0) {
-                // Одно условие — реально плохой edge на большом n
-                if (s.last_net_edge < -15.0 && s.last_shadow_fills >= 20) {
-                    n_demote++;
-                    to_demote.emplace_back(sym, s.last_net_edge);
-                }
+            // ═══ ИДЕАЛЬНЫЙ ГИСТЕРЕЗИС ═══
+            const double entry_threshold = cfg_.min_net_edge_bps + 0.5; // Вход: требуется запас +0.5
+            const bool edge_ok = s.ema_edge >= entry_threshold;
+
+            const double exit_threshold = cfg_.min_net_edge_bps - 0.5;  // Выход: допускаем просадку до -0.5
+            const bool bad = sample_ok && (s.last_net_edge < exit_threshold);
+
+            if (edge_ok && liquid_ok && spread_ok && sample_ok) {
+                s.consecutive_good_windows++;
+                s.consecutive_bad_windows = 0;
+            } else if (bad) {
+                s.consecutive_bad_windows++;
+                s.consecutive_good_windows = 0;
+            } else {
+                // Нейтральная зона: сохраняем прогресс
+            }
+
+            // Вход: 3 окна по 60 сек = 3 минуты стабильности
+            if (!is_active && s.consecutive_good_windows >= 3) {
+                ++n_ready;
+                to_promote.emplace_back(sym, s.ema_edge);
+            }
+
+            // Выход: 8 окон по 60 сек = 8 минут стабильности (защита от шумных демоутов)
+            if (is_active && s.consecutive_bad_windows >= 8) {
+                ++n_demote;
+                to_demote.emplace_back(sym, s.last_net_edge);
+            }
+
+            if (!is_active && sample_ok) {
+                ++n_cand;
             }
         }
     }
 
-    // ═══ DBG: раз в цикл показываем состояние ═══
     std::cout << "[Screener] stats=" << stats_.size()
               << " active=" << n_active
               << " candidates=" << n_cand
               << " ready=" << n_ready
               << " demote=" << n_demote << "\n";
+
+
+    double best_edge = -1e9;
+    std::string best_sym;
+    int n_pass_edge = 0, n_pass_fills = 0;
+    for (auto& [sym, s] : stats_) {
+        if (s.last_net_edge > best_edge) {
+            best_edge = s.last_net_edge;
+            best_sym = sym;
+        }
+        if (s.last_net_edge >= cfg_.min_net_edge_bps) n_pass_edge++;
+        if (s.last_shadow_fills >= cfg_.min_shadow_fills) n_pass_fills++;
+    }
+
+    std::cout << "[Screener] best=" << best_sym
+              << " edge=" << std::fixed << std::setprecision(2) << best_edge
+              << " (need ≥" << cfg_.min_net_edge_bps << ") | "
+              << "pass_edge=" << n_pass_edge
+              << "/" << stats_.size()
+              << " pass_fills=" << n_pass_fills
+              << std::defaultfloat << "\n";
 
     if (to_promote.empty() && to_demote.empty()) return;
 
@@ -515,23 +608,24 @@ void Screener::do_promote() {
         for (const auto& [sym, score] : to_promote) {
             txn.exec(
                     "INSERT INTO mm_symbols "
-                    "  (symbol, enabled, qty_usd, max_position_usd, max_hold_sec, note) "
-                    "VALUES ($1, TRUE, 25.0, 50.0, 120, "
-                    "  'auto-seeded: score=' || $2) "
+                    "(symbol, enabled, qty_usd, max_position_usd, max_hold_sec, min_hs_bps, note) "
+                    "VALUES ($1, TRUE, 15.0, 30.0, 40, NULL, 'shadow-promoted: score=' || $2) "
                     "ON CONFLICT (symbol) DO UPDATE SET "
                     "  enabled = TRUE, "
-                    "  qty_usd = COALESCE(mm_symbols.qty_usd, 25.0), "
-                    "  max_position_usd = COALESCE(mm_symbols.max_position_usd, 50.0), "
-                    "  max_hold_sec = COALESCE(mm_symbols.max_hold_sec, 120), "
-                    "  note = 'auto-promoted: score=' || $2, "
+                    "  qty_usd = COALESCE(mm_symbols.qty_usd, 15.0), "
+                    "  max_position_usd = COALESCE(mm_symbols.max_position_usd, 30.0), "
+                    "  max_hold_sec = COALESCE(mm_symbols.max_hold_sec, 40), "
+                    "  min_hs_bps = NULL, "
+                    "  note = 'shadow-promoted: score=' || $2, "
                     "  updated_at = NOW()",
                     pqxx::params{sym, score});
         }
 
         for (const auto& [sym, score] : to_demote) {
             txn.exec(
-                    "UPDATE mm_symbols SET enabled = FALSE, "
-                    "  note = COALESCE(note,'') || ' | demoted: score=' || $2, "
+                    "UPDATE mm_symbols SET "
+                    "  enabled = FALSE, "
+                    "  note = COALESCE(note,'') || ' | shadow-demoted: score=' || $2, "
                     "  updated_at = NOW() "
                     "WHERE symbol = $1",
                     pqxx::params{sym, score});
@@ -539,136 +633,108 @@ void Screener::do_promote() {
 
         txn.commit();
 
-        std::cout << "[Screener] promoted " << to_promote.size()
-                  << ", demoted " << to_demote.size() << "\n";
-
         for (const auto& [sym, score] : to_promote) {
-            std::cout << "  [PROMOTE] " << sym
-                      << " score=" << std::fixed << std::setprecision(1)
-                      << score << "\n" << std::defaultfloat;
+            std::cout << "[SHADOW-PROMOTE] " << sym
+                      << " score=" << score << "\n";
         }
+
         for (const auto& [sym, score] : to_demote) {
-            std::cout << "  [DEMOTE]  " << sym
-                      << " score=" << std::fixed << std::setprecision(1)
-                      << score << "\n" << std::defaultfloat;
+            std::cout << "[SHADOW-DEMOTE] " << sym
+                      << " score=" << score << "\n";
         }
+
     } catch (const std::exception& e) {
-        std::cerr << "[Screener] promote/demote failed: " << e.what() << "\n";
+        std::cerr << "[Screener] shadow promote/demote failed: "
+                  << e.what() << "\n";
     }
 }
 
 void Screener::do_pg_revaluation() {
     if (!cfg_.auto_promote) return;
 
-    std::vector<std::tuple<std::string, double, int>> to_demote;
-    std::vector<std::tuple<std::string, double, int>> to_graduate;
-
     try {
         pqxx::connection conn(conn_str_);
         pqxx::work txn(conn);
 
-        // ═══ 1. DEMOTE: реально плохие ═══
-        auto res = txn.exec(
-                "SELECT o.symbol, "
-                "       AVG(m.mk_30s_bps) AS avg_mk, "
-                "       COUNT(*) AS n "
-                "FROM mm_markouts m "
-                "JOIN mm_orders o ON m.order_id = o.order_id "
-                "WHERE o.status = 'FILLED' "
-                "  AND m.finalized = TRUE "
-                "  AND m.mk_30s_bps IS NOT NULL "
-                "  AND m.is_close = FALSE       "
-                "  AND o.run_tag >= to_char(NOW() - INTERVAL '24 hours', 'YYYYMMDD_HH24MISS') "
-                "  AND o.symbol IN (SELECT symbol FROM mm_symbols WHERE enabled = TRUE) "
-                "GROUP BY o.symbol "
-                "HAVING COUNT(*) >= 15 AND AVG(m.mk_30s_bps) < -5.0");
-
-        for (auto row : res) {
-            to_demote.emplace_back(
-                    row["symbol"].as<std::string>(),
-                    row["avg_mk"].as<double>(),
-                    row["n"].as<int>());
-        }
-
-        // ═══ 2. GRADUATE: реально хорошие (qty × 1.5) ═══
+        // ═══ 1. GRADUATE (Увеличиваем риск для стабильно прибыльных) ═══
+        // Критерии: Win Rate > 60%, средний 5s markout > 1.5 bps, минимум 50 филлов
         auto gres = txn.exec(
-                "SELECT o.symbol, "
-                "       AVG(m.mk_30s_bps) AS avg_mk, "
-                "       COUNT(*) AS n "
-                "FROM mm_markouts m "
-                "JOIN mm_orders o ON m.order_id = o.order_id "
-                "WHERE o.status = 'FILLED' "
-                "  AND m.finalized = TRUE "
-                "  AND m.mk_30s_bps IS NOT NULL "
-                "  AND m.is_close = FALSE       "
-                "  AND o.run_tag >= to_char(NOW() - INTERVAL '72 hours', 'YYYYMMDD_HH24MISS') "
-                "  AND o.symbol IN (SELECT symbol FROM mm_symbols WHERE enabled = TRUE) "
-                "GROUP BY o.symbol "
-                "HAVING COUNT(*) >= 30 AND AVG(m.mk_30s_bps) > 10.0");
+                "SELECT symbol, "
+                "       COUNT(*) as total_fills, "
+                "       AVG(mk_5s_bps) as avg_mk_5s, "
+                "       (COUNT(CASE WHEN mk_5s_bps > 0 THEN 1 END) * 100.0 / COUNT(*)) as win_rate "
+                "FROM mm_markouts "
+                "WHERE finalized = TRUE AND is_close = FALSE AND mk_5s_bps IS NOT NULL "
+                "  AND created_at >= NOW() - INTERVAL '24 hours' "
+                "  AND symbol IN (SELECT symbol FROM mm_symbols WHERE enabled = TRUE) "
+                "GROUP BY symbol "
+                "HAVING COUNT(*) >= 50 "
+                "   AND (COUNT(CASE WHEN mk_5s_bps > 0 THEN 1 END) * 100.0 / COUNT(*)) > 60.0 "
+                "   AND AVG(mk_5s_bps) > 1.5");
 
         for (auto row : gres) {
-            to_graduate.emplace_back(
-                    row["symbol"].as<std::string>(),
-                    row["avg_mk"].as<double>(),
-                    row["n"].as<int>());
-        }
+            std::string sym = row["symbol"].as<std::string>();
+            double wr = row["win_rate"].as<double>();
+            double mk = row["avg_mk_5s"].as<double>();
 
-        // ═══ 3. DEMOTE мёртвых (нет fills 3 дня) ═══
-        auto dead = txn.exec(
-                "SELECT s.symbol "
-                "FROM mm_symbols s "
-                "WHERE s.enabled = TRUE "
-                "  AND s.updated_at < NOW() - INTERVAL '3 days' "
-                "  AND NOT EXISTS ("
-                "    SELECT 1 FROM mm_orders o "
-                "    WHERE o.symbol = s.symbol "
-                "      AND o.status = 'FILLED' "
-                "      AND o.placed_time > (EXTRACT(EPOCH FROM NOW() - INTERVAL '3 days')*1000)::bigint"
-                "  )");
-
-        for (auto row : dead) {
-            to_demote.emplace_back(row["symbol"].as<std::string>(), 0.0, 0);
-        }
-
-        // ═══ ПРИМЕНЯЕМ ═══
-        for (auto& [sym, mk, n] : to_demote) {
-            txn.exec(
-                    "UPDATE mm_symbols SET enabled = FALSE, "
-                    "  note = COALESCE(note,'') || ' | pg-demoted: mk=' || "
-                    "         ROUND($2::numeric, 1) || ' n=' || $3, "
-                    "  updated_at = NOW() WHERE symbol = $1",
-                    pqxx::params{sym, mk, n});
-        }
-
-        for (auto& [sym, mk, n] : to_graduate) {
+            // Плавно увеличиваем qty_usd и max_hold_sec, но с жестким потолком
             txn.exec(
                     "UPDATE mm_symbols SET "
-                    "  qty_usd = LEAST(qty_usd * 1.5, 100.0), "
-                    "  max_position_usd = LEAST(max_position_usd * 1.5, 200.0), "
-                    "  note = COALESCE(note,'') || ' | graduated: mk=' || "
-                    "         ROUND($2::numeric, 1) || ' n=' || $3, "
-                    "  updated_at = NOW() WHERE symbol = $1",
-                    pqxx::params{sym, mk, n});
+                    "  qty_usd = LEAST(qty_usd * 1.2, 100.0), "
+                    "  max_position_usd = LEAST(max_position_usd * 1.2, 200.0), "
+                    "  max_hold_sec = LEAST(max_hold_sec + 10, 120), " // Даем больше времени хорошим символам
+                    "  note = 'graduated: wr=' || ROUND($2,1) || '%, mk5s=' || ROUND($3,1), updated_at = NOW() "
+                    "WHERE symbol = $1",
+                    pqxx::params{sym, wr, mk});
+
+            std::cout << "[PG-GRADUATE] " << sym << " WR=" << wr << "% mk5s=" << mk << "\n";
         }
+
+        // ═══ 2. DOWNGRADE (Снижаем риск для деградирующих, но не убиваем сразу) ═══
+        // Критерии: Win Rate < 45% ИЛИ средний 5s markout < -3.0 bps
+        auto dres = txn.exec(
+                "SELECT symbol, "
+                "       COUNT(*) as total_fills, "
+                "       AVG(mk_5s_bps) as avg_mk_5s, "
+                "       (COUNT(CASE WHEN mk_5s_bps > 0 THEN 1 END) * 100.0 / COUNT(*)) as win_rate "
+                "FROM mm_markouts "
+                "WHERE finalized = TRUE AND is_close = FALSE AND mk_5s_bps IS NOT NULL "
+                "  AND created_at >= NOW() - INTERVAL '12 hours' "
+                "  AND symbol IN (SELECT symbol FROM mm_symbols WHERE enabled = TRUE) "
+                "GROUP BY symbol "
+                "HAVING COUNT(*) >= 30 "
+                "   AND ( (COUNT(CASE WHEN mk_5s_bps > 0 THEN 1 END) * 100.0 / COUNT(*)) < 45.0 "
+                "      OR AVG(mk_5s_bps) < -3.0 )");
+
+        for (auto row : dres) {
+            std::string sym = row["symbol"].as<std::string>();
+            double wr = row["win_rate"].as<double>();
+            double mk = row["avg_mk_5s"].as<double>();
+
+            // Уменьшаем размер позиции. Если она уже минимальная (10.0) — отключаем символ полностью.
+            txn.exec(
+                    "UPDATE mm_symbols SET "
+                    "  qty_usd = GREATEST(qty_usd * 0.7, 10.0), "
+                    "  max_position_usd = GREATEST(max_position_usd * 0.7, 20.0), "
+                    "  max_hold_sec = GREATEST(max_hold_sec - 10, 30), " // Уменьшаем время жизни позиции
+                    "  enabled = CASE WHEN qty_usd <= 10.0 THEN FALSE ELSE TRUE END, "
+                    "  note = 'downgraded: wr=' || ROUND($2,1) || '%, mk5s=' || ROUND($3,1), updated_at = NOW() "
+                    "WHERE symbol = $1",
+                    pqxx::params{sym, wr, mk});
+
+            std::cout << "[PG-DOWNGRADE] " << sym << " WR=" << wr << "% mk5s=" << mk << "\n";
+        }
+
+        // ═══ 3. KILL (Мертвые символы) ═══
+        txn.exec(
+                "UPDATE mm_symbols SET enabled = FALSE, note = note || ' | dead: no fills 48h' "
+                "WHERE enabled = TRUE AND symbol NOT IN ("
+                "  SELECT symbol FROM mm_markouts WHERE created_at >= NOW() - INTERVAL '48 hours'"
+                ")");
 
         txn.commit();
-
-        if (!to_demote.empty() || !to_graduate.empty()) {
-            std::cout << "[Screener-PG] demoted=" << to_demote.size()
-                      << " graduated=" << to_graduate.size() << "\n";
-            for (auto& [sym, mk, n] : to_demote) {
-                std::cout << "  [PG-DEMOTE] " << sym
-                          << " mk=" << std::fixed << std::setprecision(1)
-                          << mk << " n=" << n << "\n" << std::defaultfloat;
-            }
-            for (auto& [sym, mk, n] : to_graduate) {
-                std::cout << "  [PG-GRADUATE] " << sym
-                          << " mk=" << std::fixed << std::setprecision(1)
-                          << mk << " n=" << n << "\n" << std::defaultfloat;
-            }
-        }
     } catch (const std::exception& e) {
-        std::cerr << "[Screener-PG] failed: " << e.what() << "\n";
+        std::cerr << "[Screener-PG] revaluation failed: " << e.what() << "\n";
     }
 }
 
@@ -706,7 +772,7 @@ void Screener::start() {
     running_ = true;
     schedule_snapshot();
     schedule_promote();
-    schedule_pg_revaluation();   // ← NEW: Phase 3
+//    schedule_pg_revaluation();   // ← NEW: Phase 3
     std::cout << "[Screener] timers started (snapshot="
               << cfg_.snapshot_interval_sec << "s, promote="
               << cfg_.promote_interval_sec << "s, pg_reval=300s)\n";

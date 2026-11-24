@@ -43,6 +43,8 @@ namespace bt {
         BacktestRunner(const RunConfig& cfg, const InstrumentParams& inst);
         BacktestResult run(const std::vector<TimedEvent>& events);
 
+        void set_tp_maker_bps(double bps);
+
     private:
         RunConfig        cfg_;
         InstrumentParams inst_;
@@ -56,6 +58,7 @@ namespace bt {
         uint64_t last_regime_update_ms_ = 0;
 
         void update_regime_inmemory(uint64_t now_ms);
+
     };
 
 }  // namespace bt

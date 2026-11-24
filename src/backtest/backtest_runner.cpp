@@ -97,6 +97,8 @@ namespace bt {
 
         int tick_counter = 0;
         uint64_t last_prune_ts = 0;
+        uint64_t last_tick_ts = 0;
+        constexpr uint64_t kTickIntervalMs = 100;
 
         for (const auto& ev : events) {
             exchange_->set_current_ts(ev.timestamp_ms);
@@ -106,13 +108,10 @@ namespace bt {
                 ++r.book_events;
                 std::string err;
                 if (!BookRebuilder::apply(book_, ev.book, &err)) {
-                    // Даже если книга невалидна — активируем pending,
-                    // иначе ордер может зависнуть в Pending навсегда
                     exchange_->process_pending_orders();
                     continue;
                 }
 
-                // Sanity: книга валидная?
                 double bb = book_.get_best_bid();
                 double ba = book_.get_best_ask();
                 if (bb <= 0.0 || ba <= 0.0 || ba < bb) {
@@ -124,31 +123,35 @@ namespace bt {
                     }
                     continue;
                 }
-                if (ba > bb * 1.10) {
-                    static int spread_warn = 0;
-                    if (spread_warn < 5) {
-                        std::cerr << "[BT-SANITY] wide spread ts=" << ev.timestamp_ms
-                                  << " bb=" << bb << " ba=" << ba
-                                  << " spread=" << ((ba - bb) / bb * 100.0) << "%\n";
-                        spread_warn++;
+                constexpr uint64_t kBookStaleMs = 10'000;
+                uint64_t book_age = (ev.timestamp_ms > book_.get_last_update_ms())
+                                    ? (ev.timestamp_ms - book_.get_last_update_ms())
+                                    : 0;
+
+                if (book_age > kBookStaleMs) {
+                    static int stale_warn = 0;
+                    if (stale_warn < 5) {
+                        std::cerr << "[BT-STALE] book age=" << book_age
+                                  << "ms > 10s, skip tick at ts=" << ev.timestamp_ms << "\n";
+                        stale_warn++;
                     }
+                    // process_pending всё равно нужен — иначе ордера застрянут
                     continue;
                 }
 
-                // Активируем pending orders (submit + latency)
-                exchange_->process_pending_orders();
+                bool should_tick = (last_tick_ts == 0)
+                                   || (ev.timestamp_ms - last_tick_ts >= kTickIntervalMs);
 
-                // MM тик — ставит/переставляет ордера
-                if (mm_) {
+                if (mm_ && should_tick) {
                     try {
                         mm_->tick();
+                        last_tick_ts = ev.timestamp_ms;
+
                         auto finalized = mm_->drain_finalized_markouts();
                         for (auto& m : finalized) {
                             r.markouts.push_back(m);
                             all_markouts_.push_back(m);
                         }
-                        // Periodic regime update (каждые 5 мин sim-времени),
-                        // только если не принудительный режим
                         if (!cfg_.force_regime_toxic && !cfg_.force_regime_illiquid) {
                             if (last_regime_update_ms_ == 0
                                 || ev.timestamp_ms - last_regime_update_ms_ >= 300'000) {
@@ -191,6 +194,23 @@ namespace bt {
                 last_prune_ts = ev.timestamp_ms;
             }
         }
+        if (mm_) {
+            std::cout << "[BT] force-finalizing markouts at ts="
+                      << (r.last_ts + 200'000) << "\n";
+            mm_->set_current_time_ms(r.last_ts + 200'000);
+            try {
+                mm_->tick();   // update_pending_markouts (после Fix 1) forced-finalize всех pending
+                auto finalized = mm_->drain_finalized_markouts();
+                for (auto& m : finalized) {
+                    r.markouts.push_back(m);
+                    all_markouts_.push_back(m);
+                }
+                std::cout << "[BT] +" << finalized.size()
+                          << " markouts from force-finalize\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[BT-FORCE] " << e.what() << "\n";
+            }
+        }
 
 // Закрываем orphan position market-ом в конце
         {
@@ -208,6 +228,46 @@ namespace bt {
         r.total_fees = exchange_->fees_paid();
         r.realized_pnl = exchange_->realized_pnl();
         r.net_pnl = r.realized_pnl - r.total_fees;
+
+        // ── В конце BacktestRunner::run() перед return r ──
+        {
+            // Классифицируем каждый fill как WIN/LOSS по mk_5s
+            int wins = 0, losses = 0, scratches = 0;
+            double sum_win = 0.0, sum_loss = 0.0;
+
+            for (const auto& m : all_markouts_) {
+                if (!m.finalized || m.is_close) continue;
+                if (m.mk_5s_bps == 0.0 && m.mk_1s_bps == 0.0) continue; // нет данных
+
+                if (m.mk_5s_bps > 2.0) {       // WIN: >2 bps через 5s
+                    wins++;
+                    sum_win += m.mk_5s_bps;
+                } else if (m.mk_5s_bps < -2.0) { // LOSS: <-2 bps через 5s
+                    losses++;
+                    sum_loss += m.mk_5s_bps;
+                } else {
+                    scratches++;
+                }
+            }
+
+            int total = wins + losses + scratches;
+            if (total > 0) {
+                double win_rate = 100.0 * wins / total;
+                double profit_factor = (sum_win > 0 && std::abs(sum_loss) > 0.01)
+                                       ? sum_win / std::abs(sum_loss)
+                                       : 0.0;
+
+                std::cout << "\n=== EDGE ANALYSIS ===\n";
+                std::cout << "Total fills:  " << total << "\n";
+                std::cout << "Wins:         " << wins << " (" << win_rate << "%)\n";
+                std::cout << "Losses:       " << losses << "\n";
+                std::cout << "Scratches:    " << scratches << "\n";
+                std::cout << "Profit Factor:" << std::fixed << std::setprecision(2)
+                          << profit_factor << "\n";
+                std::cout << "Avg Win:      " << (wins > 0 ? sum_win/wins : 0) << " bps\n";
+                std::cout << "Avg Loss:     " << (losses > 0 ? sum_loss/losses : 0) << " bps\n";
+            }
+        }
 
         return r;
     }
@@ -290,6 +350,13 @@ namespace bt {
                   << ",hit=" << snap.ask.hit_pct_1s << "%)"
                   << " vpin=" << std::setprecision(2) << vpin
                   << std::defaultfloat << "\n";
+    }
+
+    void BacktestRunner::set_tp_maker_bps(double bps) {
+        std::cout << "[RUNNER] Setting tp_maker_bps to: " << bps << "\n";
+        if (mm_) {
+            mm_->set_tp_maker_bps(bps);
+        }
     }
 
 }  // namespace bt

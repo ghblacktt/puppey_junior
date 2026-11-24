@@ -507,6 +507,9 @@ public:
     void set_momentum_threshold(double thr_bps) { momentum_thr_ = thr_bps; }
     void close_position_market(double best_bid, double best_ask,
                                const std::string& reason = "HARD_CAP");
+
+    void set_tp_maker_bps(double bps);
+
 private:
 
 
@@ -551,9 +554,8 @@ private:
         const char* ask_block_reason = "";
     };
 
+
     [[nodiscard]] auto evaluateGates(const GateInputs& in) -> SideGates;
-
-
     bool     momentum_selected_ = false;
     HmaFilter    hma_fast_{8,  1000};   // 8 секунд, быстрый тренд
     HmaFilter    hma_slow_{32, 1000};   // 32 секунды, медленный тренд
@@ -601,22 +603,22 @@ private:
     // ─────────────────────────────────────────────────────────────
     static constexpr double kNoPriceSentinel = 1e100;
     std::atomic<double> pending_cancel_ask_trigger_{ -kNoPriceSentinel };
-    std::atomic<double> pending_cancel_bid_trigger_{  kNoPriceSentinel };
 
+    std::atomic<double> pending_cancel_bid_trigger_{  kNoPriceSentinel };
     // Только tick() вызывает. Внутри — сетевой cancel + log + clear state.
     void cancel_ask_now(const std::string& reason);
-    void cancel_bid_now(const std::string& reason);
 
+    void cancel_bid_now(const std::string& reason);
     double      inventory_usd_ = 0.0;
     double      inventory_qty_ = 0.0;
     std::string inventory_side_;
-    uint64_t    position_opened_time_ = 0;
 
+    uint64_t    position_opened_time_ = 0;
     std::string bid_order_id_;
+
     std::string ask_order_id_;
 
     std::shared_ptr<pqxx::connection> db_conn_;
-
     // ─────────────────────────────────────────────────────────────
     // Deferred fills — единственный канал из ASIO fill-thread в tick-thread
     // ─────────────────────────────────────────────────────────────
@@ -629,29 +631,29 @@ private:
         bool        is_full_fill;
     };
     mutable std::mutex        deferred_fill_mtx_;
+
     std::vector<DeferredFill> deferred_fills_;
 
     // Timestamp последнего применённого fill (на tick-thread).
     // refresh_position() пропускается если now - last_fill_processed_ms_
     // < kRefreshAfterFillCooldownMs — API может быть ещё stale.
     uint64_t last_fill_processed_ms_ = 0;
-
     void process_deferred_fills(uint64_t now);
+
     void apply_fill_internal(const std::string& order_id,
                              uint64_t fill_ts_ms,
                              double   fill_price,
                              double   fill_qty,
                              const std::string& side,
                              bool     is_full_fill);
-
     // ─────────────────────────────────────────────────────────────
     // shutting_down_ — читается из handleEarlyExits (tick),
     // пишется из shutdown_gracefully (может быть любая нить)
     // ─────────────────────────────────────────────────────────────
     std::atomic<bool> shutting_down_{false};
     std::atomic<bool> shutdown_complete_{false};
-    void shutdown_do_work(const std::string& reason);
 
+    void shutdown_do_work(const std::string& reason);
     // AS/GLFT параметры
     double gamma_                = 4.0;
     double sigma_ref_            = 0.0002;
@@ -660,11 +662,11 @@ private:
     double min_half_spread_pct_  = 0.0003;
     double max_half_spread_pct_  = 0.02;
     double hard_cap_ratio_       = 0.99;
+
     double block_ratio_          = 0.10;
-
     double soft_exit_ratio_      = 0.30;
-    double soft_exit_pnl_pct_    = 0.015;
 
+    double soft_exit_pnl_pct_    = 0.015;
     // Volatility state
     VolEstimator vol_estimator_;
     double last_sigma_ = 0.0002;
@@ -675,12 +677,12 @@ private:
     uint64_t last_bid_p_time_ms_    = 0;
     uint64_t last_ask_p_time_ms_    = 0;
     double   last_bid_p_            = 0.0;
-    double   last_ask_p_            = 0.0;
 
+    double   last_ask_p_            = 0.0;
     double   last_half_spread_      = 0.0;
     double   last_skew_             = 0.0;
-    double   last_unrealized_pnl_pct_ = 0.0;
 
+    double   last_unrealized_pnl_pct_ = 0.0;
     // Close escalation
     int      close_fail_streak_     = 0;
     uint64_t close_blocked_until_   = 0;
@@ -708,9 +710,9 @@ private:
     void log_order(const std::string& order_id, const std::string& side,
                    double price, double qty, const PlaceContext& ctx);
     void log_cancel(const std::string& order_id, const std::string& reason);
+
     void log_reject(const std::string& side, double price, double qty,
                     const PlaceContext& ctx, int ret_code, const std::string& ret_msg);
-
     // ── Pending markouts (rolling) ──
     struct PendingMarkout {
         std::string order_id;
@@ -759,41 +761,42 @@ private:
     int         adverse_fill_count_ = 0;
     double entry_price_ = 0.0;
     double   obi_ema_ = 0.0;
+
     uint64_t obi_ema_last_ms_ = 0;
 
     // ─── Tick pipeline ───────────────────────────────────────
     void   logBlockingState(uint64_t now);
-
     void   cancelAllOrders(const char* reason);     // nullptr = без log_cancel
     void   cancelBidIfAny(const char* reason);
+
     void   cancelAskIfAny(const char* reason);
 
     void   processPendingClose(uint64_t now, double best_bid, double best_ask);
-
     // Возвращает true, если tick «съеден» (нужно выйти из tick()).
     auto   handleMomentumMode(uint64_t now, double mid,
                               double best_bid, double best_ask,
                               double tick_size) -> bool;
     auto   handleMaxHold(uint64_t now, double mid,
                          double best_bid, double best_ask) -> bool;
+
     bool handleTrendCut(uint64_t now, double mid, double best_bid, double best_ask,
                         double sigma);
-
     // ─── Вычисления ──────────────────────────────────────────
     auto computeMomentumSkew(uint64_t now, double mid) const -> double;
     auto computeTimeUrgency(uint64_t now) const -> double;
+
     auto computeDrift60sBps(uint64_t now, double mid) const -> double;
 
     // Возвращает mid из истории, ближайший к now-window_ms;
     // если не нашли — самый старый; если история пуста — fallback.
     auto findMidAgo(uint64_t now, uint64_t window_ms, double fallback) const -> double;
-
     void   updateSigmaEma(uint64_t now, double sigma);
-    void   pushMidHistory(uint64_t now, double mid);
 
+    void   pushMidHistory(uint64_t now, double mid);
     // ─── Логи ────────────────────────────────────────────────
     void   logDriftState(uint64_t now, double drift_bps,
                          double thr_bps, double sigma);
+
     void   logTickEnd(uint64_t now, double mid,
                       double bid_px, double ask_px,
                       bool allow_bid, bool allow_ask,
@@ -846,13 +849,12 @@ private:
         double bid_price = 0.0;   // может быть «снапнута» на last
         double ask_price = 0.0;
     };
-
     using RegimeTuning = mm_cfg::RegimeTuning;
     // ─── Методы ──────────────────────────────────────────────
     auto handleToxicFillCheck(uint64_t now, double mid,
                               double best_bid, double best_ask) -> bool;
-    auto handleVpinPause(uint64_t now) -> bool;
 
+    auto handleVpinPause(uint64_t now) -> bool;
     auto computeSignals(uint64_t now, double mid) -> Signals;
     auto computeVolatility(uint64_t now) -> VolState;
     auto computeSpreadParams(double mid, double best_bid, double best_ask,
@@ -861,11 +863,12 @@ private:
                                  double hma_skew_bps,
                                  const RegimeTuning& bid_tuning,
                                  const RegimeTuning& ask_tuning) const -> SideHalves;
-    auto computeCrossSkew(uint64_t now, double mid) -> CrossSkew;
 
+    auto computeCrossSkew(uint64_t now, double mid) -> CrossSkew;
     auto computeQuantities(double mid, double q_ratio, double eff_qty_usd,
                            const RegimeTuning& bid_tuning,
                            const RegimeTuning& ask_tuning) -> Qtys;
+
     auto clampQtyToMinNotional(double q, double mid, mm::SymMode mode) const -> double;
 
     auto computeReplaceFlags(uint64_t now,
@@ -884,7 +887,6 @@ private:
         double best_ask;
         double micro;
     };
-
     auto                            handleEarlyExits(uint64_t now) const -> bool;
     auto   readMarketSnapshot(uint64_t now) const -> std::optional<MarketSnapshot>;
     auto                            refreshPositionIfDue(uint64_t now) -> bool;
@@ -896,9 +898,17 @@ private:
                                                     double best_bid, double best_ask) -> bool;
     auto                          computeInventorySkew(uint64_t now, double half_spread,
                                                          double sigma_ratio, double q_ratio) const -> double;
-    void                            updateObiEma(uint64_t now, double obi);
 
+    void                            updateObiEma(uint64_t now, double obi);
     struct BlockRatios { double bid = 0.0; double ask = 0.0; };
     [[nodiscard]] auto computeBlockRatios() const noexcept -> BlockRatios;
+    uint64_t dust_written_off_until_ = 0;
+    bool pending_close_is_tp_ = false;
 
+    uint64_t tp_cooldown_until_ = 0;
+
+// maker TP threshold
+    double tp_maker_bps_ = 6.0;
+    bool tp_attempted_for_current_position_ = false;
+    uint64_t tp_position_entry_price_hash_ = 0; // Хэш entry_price для отслеживания
 };

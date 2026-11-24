@@ -19,6 +19,6 @@ inline void load_dotenv(const std::string& path = ".env") {
         while (!v.empty() && std::isspace((unsigned char)v.back())) v.pop_back();
         if (v.size() >= 2 && (v.front() == '"' || v.front() == '\'') && v.back() == v.front())
             v = v.substr(1, v.size() - 2);
-        if (::setenv(k.c_str(), v.c_str(), /*overwrite=*/0) != 0) { /* ignore */ }
+        if (::setenv(k.c_str(), v.c_str(), /*overwrite=*/1) != 0) { /* ignore */ }
     }
 }

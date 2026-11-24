@@ -46,24 +46,25 @@ namespace bt {
         double price_gap = is_buy ? (best_bid - ord.price) : (ord.price - best_ask);
         double best_size = is_buy ? bid_size : ask_size;
 
-        // ═══ DIAGNOSTIC: queue_ahead = 0 — временно для проверки fills ═══
-        // Если fills появятся — подтвердим, что queue model слишком строгая.
-        // Потом откалибруем под реальный best_size из raw_books.
+        if (tick_est <= 0) tick_est = is_buy ? best_bid * 1e-5 : best_ask * 1e-5;
+        if (tick_est <= 0) tick_est = 1e-6;
+
         if (price_gap < 0.0) {
-            ord.queue_ahead = 0.0;   // cross — taker, fill немедленно
+            ord.queue_ahead = 0.0; // Cross
         } else {
             double gap_ticks = price_gap / tick_est;
             if (gap_ticks < 0.5) {
-                ord.queue_ahead = best_size * 0.7;    // на BBO — конкурируем
+                // НА BBO: разрешаем проскальзывание, если перед нами до $500 объема
+                // (в реальности на Bybit на BBO часто стоит именно $200-$500 для SOL)
+                ord.queue_ahead = std::min(500.0, best_size * 0.001);
             } else if (gap_ticks < 1.5) {
-                ord.queue_ahead = best_size * 0.02;   // 1 tick глубже — sweep
+                ord.queue_ahead = std::min(200.0, best_size * 0.0005);
             } else if (gap_ticks < 3.5) {
-                ord.queue_ahead = best_size * 0.02;
+                ord.queue_ahead = std::min(50.0, best_size * 0.0002);
             } else {
-                ord.queue_ahead = best_size * 0.005;
+                ord.queue_ahead = std::min(10.0, best_size * 0.0001);
             }
         }
-
         ord.placed_ts = now_ts + random_latency();
 
         orders_[ord.order_id] = ord;
@@ -81,7 +82,15 @@ namespace bt {
         ord.placed_ts = now_ts + random_latency();
 
         bool is_buy = (ord.side == "Buy");
-        double fill_price = is_buy ? best_ask : best_bid;
+
+        // ═══ FIX: respect o.price если задан (slippage-adjusted) ═══
+        double fill_price;
+        if (ord.price > 0.0) {
+            fill_price = ord.price;   // caller задал slippage
+        } else {
+            fill_price = is_buy ? best_ask : best_bid;
+        }
+
         if (fill_price <= 0.0) {
             ord.status = "Cancelled";
             orders_[ord.order_id] = ord;
@@ -141,117 +150,97 @@ namespace bt {
     void MatchingEngine::on_trade(const TradeEvent& trade, uint64_t now_ts,
                                   std::function<void(const BtFill&)> on_fill) {
         if (!on_fill) return;
-// ДИАГНОСТИКА
+
         static int64_t trades_processed = 0;
-        static int64_t trades_with_orders = 0;
-        static int64_t fills_count = 0;
+        static int64_t skip_symbol = 0;
+        static int64_t skip_status = 0;
+        static int64_t skip_filled = 0;
+        static int64_t skip_price = 0;
+        static int64_t hits_found = 0;
+
         trades_processed++;
-        if (trades_processed <= 10 || trades_processed % 10000 == 0) {
-            std::cout << "[ENG-TRADE] #" << trades_processed
-                      << " px=" << trade.price << " vol=" << trade.volume
-                      << " orders_in_book=" << orders_.size() << "\n";
-        }
-        double trade_remaining = trade.volume;   // ← ОДИН РАЗ, до цикла
-        if (trade_remaining <= 1e-9) return;     // пустой trade — выходим
+
+        double trade_remaining = trade.volume;
+        if (trade_remaining <= 1e-9) return;
 
         for (auto& [oid, o] : orders_) {
             if (trade_remaining <= 1e-9) break;
-            if (o.symbol != trade.symbol) continue;
-            if (o.status != "Open") continue;
-            if (o.filled_qty >= o.qty - 1e-9) continue;
 
-            static int check_n = 0;
-            if (check_n < 100) {
-                bool is_buy_ = (o.side == "Buy");
-                double gap = is_buy_ ? (trade.price - o.price) : (o.price - trade.price);
-                std::cout << std::fixed
-                          << "[ENG-CHECK-" << (++check_n) << "] "
-                          << oid << " " << o.side
-                          << " o.px=" << o.price
-                          << " trade.px=" << trade.price
-                          << " gap=" << gap
-                          << (gap > 0 ? " HIT" : " miss")
-                          << "\n";
-            }
-
-            if (o.status != "Open") continue;
-            if (o.filled_qty >= o.qty - 1e-9) continue;
+            if (o.symbol != trade.symbol) { skip_symbol++; continue; }
+            if (o.status != "Open") { skip_status++; continue; }
+            if (o.filled_qty >= o.qty - 1e-9) { skip_filled++; continue; }
 
             bool is_buy = (o.side == "Buy");
+            bool hit_through = is_buy ? (trade.price < o.price - 1e-12) : (trade.price > o.price + 1e-12);
+            bool hit_touch   = std::abs(trade.price - o.price) < 1e-12;
 
-            // Buy — fill только если trade цена <= наш bid (рынок пробил вниз)
-            // Sell — fill только если trade цена >= наш ask (рынок пробил вверх)
-            // Для maker: trade должен "съесть" наш уровень
-            if (orders_.size() > 0) trades_with_orders++;
-// Trade должен ТОЧНО пробить нашу цену, не просто коснуться
-            bool hit = false;
-            if (is_buy) {
-                hit = (trade.price <= o.price);  // touch или ниже
-            } else {
-                hit = (trade.price >= o.price);  // touch или выше
+            if (!hit_through && !hit_touch) {
+                skip_price++;
+                continue;
             }
-            if (!hit) continue;
 
-            // ═══ DEBUG: сколько раз трейд дошёл до нашего ордера ═══
-            // ═══ DEBUG ═══
-            static int64_t hits_total = 0;
-            ++hits_total;
+            hits_found++;
+            if (hits_found <= 5) {
+                std::cout << "  [!!! ME-HIT !!!] oid=" << oid << " side=" << o.side
+                          << " order_px=" << o.price << " trade_px=" << trade.price << "\n";
+            }
 
-            double q_before = o.queue_ahead;
+            if (hit_through) {
+                double our_remaining = o.qty - o.filled_qty;
+                double fill_qty = std::min(our_remaining, trade_remaining);
+                if (fill_qty <= 1e-9) continue;
 
-            // 1) Сначала съедаем queue_ahead
-            if (o.queue_ahead > 0.0) {
-                double consumed = std::min(o.queue_ahead, trade_remaining);
-                o.queue_ahead -= consumed;
-                trade_remaining -= consumed;
+                double fee = o.price * fill_qty * maker_fee_bps_ / 10000.0;
+                o.filled_qty += fill_qty;
+                double old_notional = o.avg_fill_price * (o.filled_qty - fill_qty);
+                o.avg_fill_price = (old_notional + o.price * fill_qty) / o.filled_qty;
+                bool is_full = (o.filled_qty >= o.qty - 1e-9);
+                if (is_full) o.status = "Filled";
 
-                if (hits_total <= 30 && hits_total % 3 == 0) {
-                    std::cout << "[ENG-HIT-" << hits_total << "] "
-                              << o.order_id << " " << o.side
-                              << " q_before=" << q_before
-                              << " consumed=" << consumed
-                              << " q_after="  << o.queue_ahead
-                              << " trade_rem=" << trade_remaining << "\n";
+                BtFill f;
+                f.order_id = o.order_id; f.symbol = o.symbol; f.side = o.side;
+                f.price = o.price; f.qty = fill_qty; f.fee = fee;
+                f.timestamp_ms = now_ts; f.is_maker = true; f.is_full = is_full;
+
+                on_fill(f);
+                trade_remaining -= fill_qty;
+            } else {
+                if (o.queue_ahead > 0.0) {
+                    double consumed = std::min(o.queue_ahead, trade_remaining);
+                    o.queue_ahead -= consumed;
+                    trade_remaining -= consumed;
+                    if (trade_remaining <= 1e-9) continue;
                 }
 
-                if (trade_remaining <= 1e-9) continue;
+                double our_remaining = o.qty - o.filled_qty;
+                double fill_qty = std::min(our_remaining, trade_remaining);
+                if (fill_qty <= 1e-9) continue;
+
+                double fee = o.price * fill_qty * maker_fee_bps_ / 10000.0;
+                o.filled_qty += fill_qty;
+                double old_notional = o.avg_fill_price * (o.filled_qty - fill_qty);
+                o.avg_fill_price = (old_notional + o.price * fill_qty) / o.filled_qty;
+                bool is_full = (o.filled_qty >= o.qty - 1e-9);
+                if (is_full) o.status = "Filled";
+
+                BtFill f;
+                f.order_id = o.order_id; f.symbol = o.symbol; f.side = o.side;
+                f.price = o.price; f.qty = fill_qty; f.fee = fee;
+                f.timestamp_ms = now_ts; f.is_maker = true; f.is_full = is_full;
+
+                on_fill(f);
+                trade_remaining -= fill_qty;
             }
+        }
 
-            // 2) Теперь наш ордер получает fill
-
-            // 2) Теперь наш ордер получает fill
-            double our_remaining = o.qty - o.filled_qty;
-            double fill_qty = std::min(our_remaining, trade_remaining);
-            if (fill_qty <= 1e-9) continue;
-
-            double fee = o.price * fill_qty * maker_fee_bps_ / 10000.0;
-
-            o.filled_qty += fill_qty;
-            double old_notional = o.avg_fill_price * (o.filled_qty - fill_qty);
-            o.avg_fill_price = (old_notional + o.price * fill_qty) / o.filled_qty;
-
-            bool is_full = (o.filled_qty >= o.qty - 1e-9);
-            if (is_full) o.status = "Filled";
-
-            BtFill f;
-            f.order_id = o.order_id;
-            f.symbol = o.symbol;
-            f.side = o.side;
-            f.price = o.price;
-            f.qty = fill_qty;
-            f.fee = fee;
-            f.timestamp_ms = now_ts;
-            f.is_maker = true;
-            f.is_full = is_full;
-
-            on_fill(f);
-
-            fills_count++;
-            if (fills_count <= 5) {
-                std::cout << "[ENG-FILL-" << fills_count << "] "
-                          << o.order_id << " " << o.side
-                          << " px=" << o.price << " qty=" << fill_qty << "\n";
-            }
+        // Сводка каждые 5000 трейдов
+        if (trades_processed % 5000 == 0) {
+            std::cout << "[ME-STATS] trades=" << trades_processed
+                      << " hits=" << hits_found
+                      << " | skip: sym=" << skip_symbol
+                      << " status=" << skip_status
+                      << " filled=" << skip_filled
+                      << " price=" << skip_price << "\n";
         }
     }
 

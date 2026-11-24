@@ -26,9 +26,9 @@ namespace arb {
             double max_position_usd      = 60.0;
 
             // NEW: realistic execution models
-            int    latency_ms_min        = 20;
-            int    latency_ms_max        = 80;
-            bool   model_queue           = false;
+            int latency_ms_min = 30;
+            int latency_ms_max = 70;
+            bool   model_queue           = true;
             bool   model_market_slippage = true;
         };
 

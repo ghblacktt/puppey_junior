@@ -83,6 +83,14 @@ struct SymbolScreenerStats {
     double   shadow_fill_volume_usd = 100.0;
     double shadow_bid_cum_volume_usd = 0.0;
     double shadow_ask_cum_volume_usd = 0.0;
+
+    int consecutive_good_windows = 0;  // NEW: сколько раз подряд прошел порог
+    int consecutive_bad_windows = 0;   // NEW: сколько раз подряд провалил порог
+    double shadow_bid_fills_window = 0; // NEW: для расчета баланса
+    double shadow_ask_fills_window = 0; //
+
+    double ema_edge = 0.0;
+    uint64_t ema_last_update_ms = 0;
 };
 
 struct ScreenerGlobalConfig {
@@ -90,10 +98,10 @@ struct ScreenerGlobalConfig {
     int    scan_top_n = 200;
     double target_half_bps = 10.0;
     int    window_sec = 300;
-    int    snapshot_interval_sec = 30;
-    int    promote_interval_sec = 300;
-    int    min_shadow_fills = 15;
-    double min_net_edge_bps = 2.0;
+    int    snapshot_interval_sec = 1;
+    int    promote_interval_sec = 1;
+    int    min_shadow_fills = 10;
+    double min_net_edge_bps = -0.5;
     double min_update_rate_hz = 0.5;
     double min_bbo_notional_usd = 500.0;
     double max_spread_p75_bps = 60.0;

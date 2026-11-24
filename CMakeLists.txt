@@ -85,7 +85,6 @@ add_executable(bybit_client
         src/binance/binance_public_ws.cpp
         src/true_price/true_price_engine.h
         src/symbol_regime.cpp
-        src/tests/test_sprint1.cpp
         src/fill_model.cpp
         src/local_orderbook.cpp
 )
@@ -151,6 +150,11 @@ add_library(bt_core
         src/dynamic_bb_engine.cpp
         src/cross_venue_signal.cpp
         src/symbol_regime.cpp
+        src/mm_symbol_registry.cpp
+        src/fill_model.cpp
+        src/local_orderbook.cpp
+        src/screener.cpp
+        src/bybit/bybit_api_client.cpp  # <-- ОБЯЗАТЕЛЬНО ЗДЕСЬ, чтобы Screener его видел
 )
 
 target_include_directories(bt_core PUBLIC
@@ -177,8 +181,8 @@ target_link_directories(bt_core PUBLIC
 
 add_executable(bt_backtest
         src/backtest/bt_backtest.cpp
-        src/bybit/bybit_api_client.cpp
 )
+
 target_link_libraries(bt_backtest PRIVATE bt_core)
 
 if(APPLE)
@@ -199,12 +203,14 @@ if(APPLE)
 endif()
 
 # ─── Sprint 1 verification ───
-add_executable(test_sprint1 src/tests/test_sprint1.cpp
-        src/market_making_strategy.cpp
-        # ... остальные .cpp которые нужны для MarketMakingStrategy ...
-        # если OrderBook/ClusterEngine в отдельных .cpp — добавь их сюда
+add_executable(test_sprint1
+        src/tests/test_sprint1.cpp
 )
-target_include_directories(test_sprint1 PRIVATE src)
+
+target_include_directories(test_sprint1 PRIVATE src ${Boost_INCLUDE_DIRS})
+
 target_link_libraries(test_sprint1 PRIVATE
-        # те же библиотеки что и у bybit_client — pqxx, boost, simdjson, ...
+        bt_core
+        Boost::boost
+        Threads::Threads
 )

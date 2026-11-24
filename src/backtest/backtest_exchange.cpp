@@ -89,6 +89,15 @@ namespace bt {
             return "";
         }
 
+        bool is_buy = (side == "Buy");
+        bool crosses = (is_buy && px >= ba) || (!is_buy && px <= bb);
+
+        if (crosses) {
+            // Консервативно считаем crossing limit taker-ордером.
+            // Это синхронизирует BT с PaperExchange.
+            return place_market_order(s, side, qty);
+        }
+
         BtOrder o;
         static std::atomic<uint64_t> order_seq{0};
         o.order_id = "BT_" + std::to_string(current_ts_) + "_" +
@@ -150,7 +159,13 @@ namespace bt {
         o.symbol = s;
         o.side = side;
         o.type = "Market";
-        o.price = (side == "Buy") ? ba : bb;
+
+        // ═══ FIX: slippage как в PaperExchange (3 bps default) ═══
+        constexpr double kTakerSlippageBps = 3.0;
+        double slip = kTakerSlippageBps / 10000.0;
+        double fill_px = (side == "Buy") ? ba * (1.0 + slip)
+                                         : bb * (1.0 - slip);
+        o.price = fill_px;
         o.qty = qty;
         o.status = "Pending";
 

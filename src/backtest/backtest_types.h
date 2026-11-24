@@ -61,7 +61,7 @@ namespace bt {
 
         // Симуляция
         uint64_t latency_ms = 50;     // средняя задержка
-        double   latency_jitter_ms = 30;  // jitter ±30ms
+        double   latency_jitter_ms = 20;  // jitter ±30ms
     };
 
 }  // namespace bt

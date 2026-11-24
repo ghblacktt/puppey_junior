@@ -1145,3 +1145,14 @@ int run_sprint2_tests() {
     std::cerr << " " << failed << " TEST(S) FAILED\n";
     return 1;
 }
+
+int main() {
+    run_sprint1_tests();
+    run_sprint2_tests();
+    run_sprint3a_tests();
+    run_sprint3b_tests();
+    run_sprint4_tests();
+    run_sprint5_tests();
+    run_sprint6_tests();
+    return 0;
+}

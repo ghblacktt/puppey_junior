@@ -143,34 +143,6 @@ static void run_ioc_until_stopped(IoCtx& ioc, const char* tag) {
 }
 
 int main(int argc, char** argv) {
-    if (argc > 1 && std::string(argv[1]) == "--test-sprint1") {
-        extern int run_sprint1_tests();
-        return run_sprint1_tests();
-    }
-    if (argc > 1 && std::string(argv[1]) == "--test-sprint2") {
-        extern int run_sprint2_tests();
-        return run_sprint2_tests();
-    }
-    if (argc > 1 && std::string(argv[1]) == "--test-sprint3a") {
-        extern int run_sprint3a_tests();
-        return run_sprint3a_tests();
-    }
-    if (argc > 1 && std::string(argv[1]) == "--test-sprint3b") {
-        extern int run_sprint3b_tests();
-        return run_sprint3b_tests();
-    }
-    if (argc > 1 && std::string(argv[1]) == "--test-sprint4") {
-        extern int run_sprint4_tests();
-        return run_sprint4_tests();
-    }
-    if (argc > 1 && std::string(argv[1]) == "--test-sprint5") {
-        extern int run_sprint5_tests();
-        return run_sprint5_tests();
-    }
-    if (argc > 1 && std::string(argv[1]) == "--test-sprint6") {
-        extern int run_sprint6_tests();
-        return run_sprint6_tests();
-    }
     load_dotenv();
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
@@ -190,6 +162,8 @@ int main(int argc, char** argv) {
         BitunixKey    = env_required("BITUNIX_API_KEY");
         BitunixSecret = env_required("BITUNIX_API_SECRET");
         ConnStr       = env_required("PG_CONN_STR");
+        std::cout << "[MAIN] PG_CONN_STR is: '" << ConnStr << "'\n";
+
     } catch (const std::exception& e) {
         std::cerr << "[MAIN] config error: " << e.what() << "\n";
         return EXIT_FAILURE;
@@ -233,12 +207,14 @@ int main(int argc, char** argv) {
     }
 
     PaperExchange::Config cfg;
-    cfg.initial_balance_usd   = 10000.0;
-    cfg.maker_fee_bps         = 2.0;
-    cfg.taker_fee_bps         = 5.5;
-    cfg.taker_slippage_bps    = 3.0;
+    cfg.initial_balance_usd = 10000.0;
+    cfg.maker_fee_bps       = 2.0;
+    cfg.taker_fee_bps       = 5.5;
+    cfg.taker_slippage_bps  = 3.0;
     cfg.touch_fill_volume_usd = 50.0;
-    cfg.max_position_usd      = 200.0;
+    cfg.max_position_usd    = 200.0;
+    cfg.latency_ms_min      = 30;
+    cfg.latency_ms_max      = 70;
 
     net::io_context exec_ioc;
     auto paper = std::make_unique<PaperExchange>(*api, exec_ioc, cfg);
@@ -337,10 +313,10 @@ int main(int argc, char** argv) {
     }
 
 
-    if (exec_symbols.empty()) {
-        std::cerr << "[MAIN] FATAL: no whitelisted symbols\n";
-        return EXIT_FAILURE;
-    }
+//    if (exec_symbols.empty()) {
+//        std::cerr << "[MAIN] FATAL: no whitelisted symbols\n";
+//        return EXIT_FAILURE;
+//    }
 
     std::cout << "[MAIN] Executor trading " << exec_symbols.size()
               << " symbols (from " << liquid_syms.size() << " liquid)\n";
@@ -455,7 +431,7 @@ int main(int argc, char** argv) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 6) Scanner
+    // 6) Scanner & WS Symbols (ОБЪЕДИНЕНИЕ DB + TOP LIQUID)
     // ═══════════════════════════════════════════════════════════
     net::io_context screener_ioc;
     auto screener = std::make_shared<Screener>(screener_ioc, ConnStr);
@@ -463,45 +439,55 @@ int main(int argc, char** argv) {
     screener->set_registry(registry);
     screener->load(*api);
 
-// В main.cpp, где формируется scan_symbols
     std::vector<std::string> scan_symbols;
-    {
-        auto top = api->get_top_liquid_symbols(screener->config().scan_top_n);
-        int n_stable = 0, n_not_perp = 0, n_dated = 0, n_stock = 0;
-        for (const auto& s : top) {
-            if (is_stable_base(s)) { n_stable++; continue; }
+    std::unordered_set<std::string> unique_symbols;
 
-            // ═══ NEW: skip dated futures (содержат '-') ═══
-            if (s.find('-') != std::string::npos) { n_dated++; continue; }
-
-            // ═══ NEW: REST-проверка что это LinearPerpetual USDT Trading ═══
-            auto inst = api->get_instrument_info(s, "linear");
-            if (inst.step_size <= 0.0) { n_not_perp++; continue; }
-
-            // ═══ NEW: skip stock perps (эвристика по префиксу) ═══
-            // Список известных stock-bases на Bybit (расширяй по мере надобности)
-            static const std::set<std::string> kStockBases = {
-                    "AAPL","TSLA","NVDA","GOOGL","AMZN","META","MSFT","NFLX",
-                    "PLTR","ARM","AXP","CSCO","COIN","MSTR","HOOD","IBIT",
-                    "MRVL","CRWV","NBIS","SOXL","SOXS","TQQQ","SQQQ","SPX",
-                    "QQQ","SPCX","EWY","SAMSUNG","SKHY","CRCL","AMD"
-            };
-            auto strip_usdt = [](const std::string& x) {
-                return (x.size() > 4 && x.substr(x.size()-4) == "USDT")
-                       ? x.substr(0, x.size()-4) : x;
-            };
-            std::string base = strip_usdt(s);
-            if (kStockBases.count(base)) { n_stock++; continue; }
-
-            scan_symbols.push_back(s);
+    // 1. ВСЕГДА добавляем символы, которые включены в БД (The Right Way)
+    auto db_enabled = registry->enabled_symbols();
+    for (const auto& s : db_enabled) {
+        if (!is_stable_base(s) && s.find('-') == std::string::npos) {
+            unique_symbols.insert(s);
         }
-        std::cout << "[MAIN] Scanner filter: total=" << top.size()
-                  << " stable=" << n_stable
-                  << " dated=" << n_dated
-                  << " not_perp=" << n_not_perp
-                  << " stock=" << n_stock
-                  << " → keep=" << scan_symbols.size() << "\n";
     }
+
+    // 2. ДОБАВЛЯЕМ топ ликвидных для анализа скринером
+    auto top = api->get_top_liquid_symbols(screener->config().scan_top_n);
+    int n_stable = 0, n_not_perp = 0, n_dated = 0, n_stock = 0;
+
+    static const std::set<std::string> kStockBases = {
+            "AAPL","TSLA","NVDA","GOOGL","AMZN","META","MSFT","NFLX",
+            "PLTR","ARM","AXP","CSCO","COIN","MSTR","HOOD","IBIT",
+            "MRVL","CRWV","NBIS","SOXL","SOXS","TQQQ","SQQQ","SPX",
+            "QQQ","SPCX","EWY","SAMSUNG","SKHY","CRCL","AMD"
+    };
+    auto strip_usdt = [](const std::string& x) {
+        return (x.size() > 4 && x.substr(x.size()-4) == "USDT")
+               ? x.substr(0, x.size()-4) : x;
+    };
+
+    for (const auto& s : top) {
+        if (is_stable_base(s)) { n_stable++; continue; }
+        if (s.find('-') != std::string::npos) { n_dated++; continue; }
+
+        auto inst = api->get_instrument_info(s, "linear");
+        if (inst.step_size <= 0.0) { n_not_perp++; continue; }
+
+        std::string base = strip_usdt(s);
+        if (kStockBases.count(base)) { n_stock++; continue; }
+
+        unique_symbols.insert(s);
+    }
+
+    // Преобразуем set обратно в vector
+    scan_symbols.assign(unique_symbols.begin(), unique_symbols.end());
+
+    std::cout << "[MAIN] Scanner/WS filter: db_enabled=" << db_enabled.size()
+              << " + top_liquid=" << top.size()
+              << " (filtered: stable=" << n_stable
+              << ", dated=" << n_dated
+              << ", not_perp=" << n_not_perp
+              << ", stock=" << n_stock << ")"
+              << " → TOTAL SUBSCRIBED=" << scan_symbols.size() << "\n";
 
     ssl::context screener_ssl_ctx(ssl::context::tlsv12_client);
     screener_ssl_ctx.set_default_verify_paths();
@@ -514,6 +500,7 @@ int main(int argc, char** argv) {
         screener->start();
         run_ioc_until_stopped(screener_ioc, "SCREENER");
     });
+
 
     auto ws_client = std::make_shared<BybitWSClient>(
             exec_ioc, exec_ssl_ctx, scan_symbols,

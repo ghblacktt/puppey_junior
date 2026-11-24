@@ -26,16 +26,17 @@ namespace mm {
         }
 
         const bool toxic =
-                s.hit_pct_1s  < 30.0
-                || s.med_mk_1s   < -2.0
-                || s.med_mk_30s  < -2.0
-                || vpin_now      > 0.75;
+                s.hit_pct_1s  < 25.0          // Было 30.0 (слишком строго для альткоинов)
+                || s.med_mk_1s   < -3.5       // Было -2.0 (это нормальная волатильность)
+                || s.med_mk_30s  < -5.0       // Было -2.0 (настоящий адверс начинается здесь)
+                || vpin_now      > 0.85;      // Было 0.75 (0.75 бывает при обычном дисбалансе)
+
         if (toxic) return SymMode::Toxic;
 
         if (depth_usdt > 500'000.0
             && spread_bps < 5.0
             && s.hit_pct_1s >= 40.0
-            && s.med_mk_30s >= -0.5
+            && s.med_mk_30s >= -1.0           // Было -0.5 (слишком идеально)
             && s.n_markouts_4h >= 30) {
             return SymMode::Tier1;
         }
@@ -47,36 +48,32 @@ namespace mm {
                                  SymModeSide        candidate,
                                  uint64_t           now_ms)
     {
-        constexpr uint64_t kMinHoldMs    = 30ULL * 60 * 1000;    // 30 мин до любого перехода
-        constexpr uint64_t kExitToxicMs  = 2ULL * 60 * 60 * 1000; // 2 часа чтобы выйти из Toxic
-        constexpr uint64_t kExitTier1Ms  = 4ULL * 60 * 60 * 1000; // 4 часа чтобы выйти из Tier1
+        constexpr uint64_t kMinHoldMs   = 30ULL * 60 * 1000;    // 30 мин до любого перехода
+        constexpr uint64_t kExitToxicMs = 2ULL * 60 * 60 * 1000; // 2 часа чтобы выйти из Toxic
 
         if (prev.mode == candidate.mode) {
             candidate.entered_mode_ms = prev.entered_mode_ms;
             return candidate;
         }
 
+        // ═══ FIX: АМНИСТИЯ. Если новых филлов меньше 15, мы НЕ МОЖЕМ считать символ токсичным.
+        // Это ломает цикл "вечного Toxic", когда данные устарели (n=0).
+        if (candidate.n_markouts_4h < 15) {
+            candidate.mode = SymMode::Normal;
+            candidate.entered_mode_ms = now_ms;
+            return candidate;
+        }
+
         // Ещё не сидели в предыдущем режиме min_hold — не переключаемся
-        if (prev.entered_mode_ms > 0
-            && (now_ms - prev.entered_mode_ms) < kMinHoldMs) {
+        if (prev.entered_mode_ms > 0 && (now_ms - prev.entered_mode_ms) < kMinHoldMs) {
             candidate.mode = prev.mode;
             candidate.entered_mode_ms = prev.entered_mode_ms;
             return candidate;
         }
 
-        // Выход из Toxic — медленный (автор: «токсик вернётся через 48ч»)
-        if (prev.mode == SymMode::Toxic
-            && prev.entered_mode_ms > 0
+        // Выход из Toxic — медленный (но Амнистия выше уже перехватила случай n < 15)
+        if (prev.mode == SymMode::Toxic && prev.entered_mode_ms > 0
             && (now_ms - prev.entered_mode_ms) < kExitToxicMs) {
-            candidate.mode = prev.mode;
-            candidate.entered_mode_ms = prev.entered_mode_ms;
-            return candidate;
-        }
-
-        // Выход из Tier1 — медленный (не дёргаемся)
-        if (prev.mode == SymMode::Tier1
-            && prev.entered_mode_ms > 0
-            && (now_ms - prev.entered_mode_ms) < kExitTier1Ms) {
             candidate.mode = prev.mode;
             candidate.entered_mode_ms = prev.entered_mode_ms;
             return candidate;
