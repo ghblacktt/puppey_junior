@@ -87,6 +87,8 @@ add_executable(bybit_client
         src/symbol_regime.cpp
         src/fill_model.cpp
         src/local_orderbook.cpp
+        src/TimeDecayStats.cpp
+        src/time_decay_stats.h
 )
 
 target_include_directories(bybit_client PRIVATE
